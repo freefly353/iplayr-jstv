@@ -734,6 +734,32 @@ async function fetchBinary(url, headers, timeoutMs) {
     }
 }
 
+// 流式拉取：转成 Node Readable 交给 Fastify 边下边发（首字节更快）。
+// 转不了就退回整段缓冲，保证能播优先。
+async function fetchStream(url, headers, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 60000);
+    try {
+        const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
+        let body = resp.body;
+        try {
+            const { Readable } = require("stream");
+            if (body && typeof Readable.fromWeb === "function") body = Readable.fromWeb(body);
+        } catch (_) {
+            body = Buffer.from(await resp.arrayBuffer());
+        }
+        return {
+            status: resp.status,
+            body,
+            contentType: resp.headers.get("content-type") || "application/octet-stream",
+            finalUrl: resp.url || url,
+        };
+    } catch (e) {
+        clearTimeout(timer);
+        throw e;
+    }
+}
+
 // ---------- JSONPath 子集 ----------
 // 支持 $、.key、[*]、[n]。返回匹配值数组。
 
@@ -1435,9 +1461,9 @@ function createIPlayrSpider(rule, opts) {
             }
             if (action === "seg") {
                 try {
-                    const resp = await fetchBinary(u, reqHeaders());
-                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && resp.body.length > 0, u: u.slice(0, 80) });
-                    if (resp.status !== 200 || !resp.body.length) {
+                    const resp = await fetchStream(u, reqHeaders());
+                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && !!resp.body, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.body) {
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
                     return [200, resp.contentType, resp.body, { "Content-Type": resp.contentType }];
@@ -1472,7 +1498,7 @@ category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.
 detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
 search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
 play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
+proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}return body;});},
 destroy(){return core.destroy();}
 };
 return spider;
