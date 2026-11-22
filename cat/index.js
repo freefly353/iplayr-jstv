@@ -1063,7 +1063,7 @@ function createIPlayrSpider(rule, opts) {
     // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
     // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
     // 播放器只跟 127.0.0.1 打交道。
-    const PROXY_BUILD = "iplayr-proxy-v1";
+    const PROXY_BUILD = "iplayr-proxy-v2";
     let proxyBase = "http://127.0.0.1:9988";
     const diagLog = [];
     function diagPush(action, info) {
