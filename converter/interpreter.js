@@ -63,6 +63,13 @@ function resolveUrl(maybeRel, base) {
     }
 }
 
+// 列表海报缩小：TMDB w500（约 59KB）对列表缩略图过大，换 w185（约 19KB）
+// 只动 image.tmdb.org 的尺寸段，其他图源原样
+function shrinkPoster(u) {
+    if (!isStr(u)) return u;
+    return u.replace(/^(https?:\/\/image\.tmdb\.org\/t\/p\/)w\d+(\/)/i, "$1w185$2");
+}
+
 // 规则里的正则字段是 base64 编码；解码失败或解出不可打印内容时按原文用
 function decodeRuleRegex(s) {
     if (!isStr(s)) return "";
@@ -478,7 +485,7 @@ function createIPlayrSpider(rule, opts) {
     // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
     // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
     // 播放器只跟 127.0.0.1 打交道。
-    const PROXY_BUILD = "iplayr-proxy-v2.2";
+    const PROXY_BUILD = "iplayr-proxy-v2.3";
     let proxyBase = "http://127.0.0.1:9988";
     const diagLog = [];
     function diagPush(action, info) {
@@ -544,7 +551,7 @@ function createIPlayrSpider(rule, opts) {
                 if (!rawId) continue;
                 let img = jsonField(it, data, f.imageId);
                 if (isStr(f.imageRegex)) img = applyRegex(img, decodeRuleRegex(f.imageRegex)) || img;
-                const pic = resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl);
+                const pic = shrinkPoster(resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl));
                 out.push({
                     vod_id: rawId,
                     vod_name: jsonField(it, data, f.title) || rawId,
@@ -565,7 +572,7 @@ function createIPlayrSpider(rule, opts) {
                 const rx = f.imageRegex.trim();
                 img = rx.startsWith("/") ? htmlField(nd, rx) : applyRegex(img, decodeRuleRegex(rx)) || img;
             }
-            const pic = resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl);
+            const pic = shrinkPoster(resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl));
             out.push({
                 vod_id: rawId,
                 vod_name: htmlField(nd, f.title) || rawId,
