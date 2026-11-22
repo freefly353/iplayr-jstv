@@ -63,13 +63,6 @@ function resolveUrl(maybeRel, base) {
     }
 }
 
-// 列表海报缩小：TMDB w500（约 59KB）对列表缩略图过大，换 w185（约 19KB）
-// 只动 image.tmdb.org 的尺寸段，其他图源原样
-function shrinkPoster(u) {
-    if (!isStr(u)) return u;
-    return u.replace(/^(https?:\/\/image\.tmdb\.org\/t\/p\/)w\d+(\/)/i, "$1w185$2");
-}
-
 // 规则里的正则字段是 base64 编码；解码失败或解出不可打印内容时按原文用
 function decodeRuleRegex(s) {
     if (!isStr(s)) return "";
@@ -153,32 +146,6 @@ async function fetchBinary(url, headers, timeoutMs) {
         };
     } finally {
         clearTimeout(timer);
-    }
-}
-
-// 流式拉取：转成 Node Readable 交给 Fastify 边下边发（首字节更快）。
-// 转不了就退回整段缓冲，保证能播优先。
-async function fetchStream(url, headers, timeoutMs) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 60000);
-    try {
-        const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
-        let body = resp.body;
-        try {
-            const { Readable } = require("stream");
-            if (body && typeof Readable.fromWeb === "function") body = Readable.fromWeb(body);
-        } catch (_) {
-            body = Buffer.from(await resp.arrayBuffer());
-        }
-        return {
-            status: resp.status,
-            body,
-            contentType: resp.headers.get("content-type") || "application/octet-stream",
-            finalUrl: resp.url || url,
-        };
-    } catch (e) {
-        clearTimeout(timer);
-        throw e;
     }
 }
 
@@ -485,7 +452,7 @@ function createIPlayrSpider(rule, opts) {
     // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
     // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
     // 播放器只跟 127.0.0.1 打交道。
-    const PROXY_BUILD = "iplayr-proxy-v2.3";
+    const PROXY_BUILD = "iplayr-proxy-v1.0";
     let proxyBase = "http://127.0.0.1:9988";
     const diagLog = [];
     function diagPush(action, info) {
@@ -551,7 +518,7 @@ function createIPlayrSpider(rule, opts) {
                 if (!rawId) continue;
                 let img = jsonField(it, data, f.imageId);
                 if (isStr(f.imageRegex)) img = applyRegex(img, decodeRuleRegex(f.imageRegex)) || img;
-                const pic = shrinkPoster(resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl));
+                const pic = resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl);
                 out.push({
                     vod_id: rawId,
                     vod_name: jsonField(it, data, f.title) || rawId,
@@ -572,7 +539,7 @@ function createIPlayrSpider(rule, opts) {
                 const rx = f.imageRegex.trim();
                 img = rx.startsWith("/") ? htmlField(nd, rx) : applyRegex(img, decodeRuleRegex(rx)) || img;
             }
-            const pic = shrinkPoster(resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl));
+            const pic = resolveUrl(fillTemplate(f.imageUrl || "{id}", { id: img }), pageUrl);
             out.push({
                 vod_id: rawId,
                 vod_name: htmlField(nd, f.title) || rawId,
@@ -597,22 +564,8 @@ function createIPlayrSpider(rule, opts) {
         };
     }
 
-    // 列表响应短缓存：JSTV 常重复调 category/homeVod，5 分钟内同 URL 不重复拉上游
-    const listCache = new Map();
     async function fetchList(url, fields) {
-        const now = Date.now();
-        const hit = listCache.get(url);
-        if (hit && now - hit.ts < 300000) {
-            diagPush("list", { ms: 0, cached: true, u: url.slice(0, 80) });
-            return extractItems(hit.text, hit.finalUrl, fields);
-        }
-        const t0 = Date.now();
-        const { status, text, finalUrl } = await fetchText(url, reqHeaders());
-        diagPush("list", { ms: Date.now() - t0, status, cached: false, u: url.slice(0, 80) });
-        if (status === 200 && text) {
-            listCache.set(url, { text, finalUrl, ts: now });
-            if (listCache.size > 64) listCache.delete(listCache.keys().next().value);
-        }
+        const { text, finalUrl } = await fetchText(url, reqHeaders());
         return extractItems(text, finalUrl, fields);
     }
 
@@ -640,17 +593,7 @@ function createIPlayrSpider(rule, opts) {
             if (typeof url === "string" && url) proxyBase = url.replace(/\/+$/, "");
         },
 
-        init() {
-            // 后台预热：先把第一个分类第一页拉进缓存，顺带建好到上游的连接，
-            // 用户点开列表时直接命中缓存，不用等跨境握手+拉取
-            try {
-                const c = (Array.isArray(R.category) ? R.category : [])[0];
-                if (c) {
-                    const url = fillTemplate(c.url0 || c.url1, { pg: 1 });
-                    fetchList(url, listFields("vod")).catch(() => {});
-                }
-            } catch (_) {}
-        },
+        init() {},
 
         async home() {
             const cats = Array.isArray(R.category) ? R.category : [];
@@ -907,9 +850,9 @@ function createIPlayrSpider(rule, opts) {
             }
             if (action === "seg") {
                 try {
-                    const resp = await fetchStream(u, reqHeaders());
-                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && !!resp.body, u: u.slice(0, 80) });
-                    if (resp.status !== 200 || !resp.body) {
+                    const resp = await fetchBinary(u, reqHeaders());
+                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && resp.body.length > 0, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.body.length) {
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
                     return [200, resp.contentType, resp.body, { "Content-Type": resp.contentType }];
