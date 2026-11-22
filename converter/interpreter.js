@@ -87,6 +87,34 @@ function applyRegex(text, pattern) {
     }
 }
 
+// MacCMS 播放页 player_aaaa 解码（encrypt: 0 明文 / 1 unescape / 2 base64+unescape）
+// 解出的是媒体地址才返回，否则 null（encrypt=3 等自定义加密走嗅探兜底）
+function decodePlayerAaaa(html) {
+    if (!isStr(html)) return null;
+    const m =
+        /player_aaaa\s*=\s*(\{.*?\})\s*;?\s*<\/script>/s.exec(html) ||
+        /player_aaaa\s*=\s*(\{[^\n]*\})/.exec(html);
+    if (!m) return null;
+    let d;
+    try {
+        d = JSON.parse(m[1]);
+    } catch (_) {
+        return null;
+    }
+    let url = toStr(d.url);
+    if (!url) return null;
+    const enc = String(d.encrypt ?? "0");
+    try {
+        if (enc === "1") url = decodeURIComponent(url);
+        else if (enc === "2") url = decodeURIComponent(Buffer.from(url, "base64").toString("utf8"));
+        else if (enc !== "0") return null;
+    } catch (_) {
+        return null;
+    }
+    if (/\.(m3u8|mp4|flv|mkv|mpd|ts)(\?|#|$)/i.test(url) || /m3u8/i.test(url)) return url;
+    return null;
+}
+
 // ---------- HTTP ----------
 
 const DEFAULT_UA =
@@ -99,6 +127,23 @@ async function fetchText(url, headers, timeoutMs) {
         const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
         const text = await resp.text();
         return { status: resp.status, text, finalUrl: resp.url || url };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function fetchBinary(url, headers, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 30000);
+    try {
+        const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
+        const buf = Buffer.from(await resp.arrayBuffer());
+        return {
+            status: resp.status,
+            body: buf,
+            contentType: resp.headers.get("content-type") || "application/octet-stream",
+            finalUrl: resp.url || url,
+        };
     } finally {
         clearTimeout(timer);
     }
@@ -403,6 +448,62 @@ function createIPlayrSpider(rule, opts) {
         return h;
     }
 
+    // ---------- HLS 本地代理 ----------
+    // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
+    // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
+    // 播放器只跟 127.0.0.1 打交道。
+    const PROXY_BUILD = "iplayr-proxy-v1";
+    let proxyBase = "http://127.0.0.1:9988";
+    const diagLog = [];
+    function diagPush(action, info) {
+        try {
+            diagLog.push(Object.assign({ t: new Date().toISOString().slice(11, 19), action }, info));
+            while (diagLog.length > 50) diagLog.shift();
+        } catch (_) {}
+    }
+    function proxyUrlFor(action, upstream) {
+        return (
+            proxyBase +
+            "/spider/" +
+            encodeURIComponent(opts.key || "iplayr") +
+            "/3/proxy/" +
+            action +
+            "?u=" +
+            encodeURIComponent(upstream)
+        );
+    }
+    function isHlsUrl(u) {
+        return /\.m3u8(\?|#|$)/i.test(toStr(u)) || /m3u8/i.test(toStr(u));
+    }
+    function rewritePlaylist(text, upstreamUrl) {
+        const lines = String(text || "").split(/\r?\n/);
+        const out = [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line) { out.push(line); continue; }
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                out.push(line);
+                if (i + 1 < lines.length && lines[i + 1] && !lines[i + 1].startsWith("#")) {
+                    out.push(proxyUrlFor("pl.m3u8", resolveUrl(lines[i + 1].trim(), upstreamUrl)));
+                    i++;
+                }
+                continue;
+            }
+            if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP") || line.startsWith("#EXT-X-MEDIA")) {
+                out.push(
+                    line.replace(/URI="([^"]+)"/g, (m, uri) => {
+                        const abs = resolveUrl(uri, upstreamUrl);
+                        return 'URI="' + proxyUrlFor(line.startsWith("#EXT-X-MEDIA") ? "pl.m3u8" : "seg", abs) + '"';
+                    })
+                );
+                continue;
+            }
+            if (line.startsWith("#")) { out.push(line); continue; }
+            out.push(proxyUrlFor("seg", resolveUrl(line.trim(), upstreamUrl)));
+        }
+        return out.join("\n");
+    }
+
     // 从列表响应提取条目（JSON / HTML 两路）
     function extractItems(text, pageUrl, f) {
         // f: {node, title, imageId, imageRegex, imageUrl, linkId, info, score}
@@ -488,7 +589,9 @@ function createIPlayrSpider(rule, opts) {
             filterable: 0,
         },
 
-        setProxyBase() {},
+        setProxyBase(url) {
+            if (typeof url === "string" && url) proxyBase = url.replace(/\/+$/, "");
+        },
 
         init() {},
 
@@ -645,6 +748,8 @@ function createIPlayrSpider(rule, opts) {
         async play(flag, id) {
             const pid = toStr(id);
             const header = playHeaders();
+            // HLS 地址走本地代理（spider 带浏览器 UA 拉上游，避开 UA 拦截）
+            const wrap = (u) => (isHlsUrl(u) ? proxyUrlFor("pl.m3u8", u) : u);
             // JSON TV 型：id 是单集接口，再取 sources
             if (isStr(R.play_node)) {
                 const { text, finalUrl } = await fetchText(pid, reqHeaders());
@@ -656,24 +761,42 @@ function createIPlayrSpider(rule, opts) {
                         const sid = jsonField(s, data, R.play_link_id);
                         if (!sid) continue;
                         const url = resolveUrl(fillTemplate(R.play_source_url || "{id}", { id: sid }), finalUrl);
-                        if (url) return { parse: 0, url, header };
+                        if (url) return { parse: 0, url: wrap(url), header };
                     }
                 }
-                return { parse: 0, url: pid, header };
+                return { parse: 0, url: wrap(pid), header };
             }
-            // HTML 型：id 是播放页，play_regex 抠真实地址
-            if (isStr(R.play_regex)) {
-                const { text, finalUrl } = await fetchText(pid, reqHeaders());
-                const cap = applyRegex(text, decodeRuleRegex(R.play_regex));
-                if (cap) {
-                    const url = resolveUrl(fillTemplate(R.play_url || "{id}", { id: cap }), finalUrl);
-                    return { parse: 0, url, header };
+            // id 本身已是媒体地址：不用抓页（HLS 仍走代理）
+            if (/\.(m3u8|mp4|flv|mkv|mpd|ts)(\?|#|$)/i.test(pid)) {
+                return { parse: 0, url: wrap(pid), header };
+            }
+            // 抓播放页：依次试 规则正则 → MacCMS player_aaaa 解码 → 页面直链
+            let pageText = "";
+            let pageUrl = pid;
+            try {
+                const resp = await fetchText(pid, reqHeaders());
+                pageText = resp.text;
+                pageUrl = resp.finalUrl;
+            } catch (_) { /* 抓页失败走嗅探兜底 */ }
+            if (pageText) {
+                // 抓到的本身就是 m3u8 清单（如 dexter 接口）：走代理交给播放器
+                if (pageText.trimStart().startsWith("#EXTM3U")) {
+                    return { parse: 0, url: proxyUrlFor("pl.m3u8", pid), header };
                 }
-                return { parse: 1, url: pid, header };
+                if (isStr(R.play_regex)) {
+                    const cap = applyRegex(pageText, decodeRuleRegex(R.play_regex));
+                    if (cap) {
+                        const url = resolveUrl(fillTemplate(R.play_url || "{id}", { id: cap }), pageUrl);
+                        return { parse: 0, url: wrap(url), header };
+                    }
+                }
+                const pa = decodePlayerAaaa(pageText);
+                if (pa) return { parse: 0, url: wrap(resolveUrl(pa, pageUrl)), header };
+                const direct = /(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)/i.exec(pageText);
+                if (direct) return { parse: 0, url: wrap(direct[1]), header };
             }
-            // 已是媒体地址直接播；否则是播放页，交给播放器嗅探（parse:1）
-            const isMedia = /\.(m3u8|mp4|flv|mkv|mpd|ts)(\?|#|$)/i.test(pid) || /m3u8/i.test(pid);
-            return { parse: isMedia ? 0 : 1, url: pid, header };
+            // 抠不到真实地址：交给播放器嗅探
+            return { parse: 1, url: pid, header };
         },
 
         async search(wd, quick, pg) {
@@ -692,8 +815,53 @@ function createIPlayrSpider(rule, opts) {
             };
         },
 
-        proxy() {
-            return [404, "text/plain", "not found", {}];
+        async proxy(params) {
+            let query = params;
+            if (typeof query === "string") {
+                query = {};
+                for (const pair of String(params).split("&")) {
+                    const [k, v] = pair.split("=");
+                    if (k) query[decodeURIComponent(k)] = v ? decodeURIComponent(v) : "";
+                }
+            }
+            query = query || {};
+            let action = String(query.do || query.action || "").replace(/\.(m3u8|ts|m4s)$/i, "");
+            if (action === "diag") {
+                const body = JSON.stringify({ version: PROXY_BUILD, diag: diagLog.slice().reverse() }, null, 1);
+                return [200, "application/json", body, { "Content-Type": "application/json" }];
+            }
+            const u = toStr(query.u);
+            if (!u) {
+                return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
+            }
+            if (action === "pl") {
+                try {
+                    const resp = await fetchText(u, reqHeaders());
+                    diagPush("pl", { status: resp.status, ok: resp.status === 200 && !!resp.text, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.text) {
+                        return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
+                    }
+                    const rewritten = rewritePlaylist(resp.text, resp.finalUrl);
+                    return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
+                } catch (e) {
+                    diagPush("pl", { status: 0, ok: false, err: String((e && e.message) || e).slice(0, 60) });
+                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
+                }
+            }
+            if (action === "seg") {
+                try {
+                    const resp = await fetchBinary(u, reqHeaders());
+                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && resp.body.length > 0, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.body.length) {
+                        return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
+                    }
+                    return [200, resp.contentType, resp.body, { "Content-Type": resp.contentType }];
+                } catch (e) {
+                    diagPush("seg", { status: 0, ok: false, err: String((e && e.message) || e).slice(0, 60) });
+                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
+                }
+            }
+            return [404, "text/plain", "unknown proxy action", { "Content-Type": "text/plain" }];
         },
 
         destroy() {},

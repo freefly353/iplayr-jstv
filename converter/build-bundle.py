@@ -76,6 +76,16 @@ def main():
         if rule is None or not rule.get("category"):
             continue
         rules.append((fn[:-5], rule))
+    # bundle 清单：存在则只打包清单内的规则（converter/bundle-rules.txt，一行一个规则名）
+    bundle_list_path = os.path.join(BASE, "converter", "bundle-rules.txt")
+    if os.path.exists(bundle_list_path):
+        keep = set()
+        for line in open(bundle_list_path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                keep.add(line)
+        rules = [(b, r) for (b, r) in rules if b in keep]
+        print(f"bundle-rules filter: keeping {len(rules)} of {len(keep)} listed")
     print(f"rules to pack: {len(rules)}")
 
     # 启用清单（与原仓库 import.json 的 type=8 规则一致）；不在清单内的 enable:false
