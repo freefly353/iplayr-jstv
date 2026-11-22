@@ -1,0 +1,60 @@
+{
+"uuid":"6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2",
+"title":"huangguo",
+"episode_flag":false,
+"landscape_flag":false,
+"referer":"https://huangguoai.com/",
+"cf_flag":true,
+"imgkey":"f5d965df75336270",
+"imgiv":"97b60394abc2fbe1",
+"imgmethod":"AES-128-CBC",
+"open_with_safari_flag":true,
+"category": [{
+			"title": "短剧",
+			"url0": "https://huangguoai.com/ai-duanju/",
+			"url1": "https://huangguoai.com/ai-duanju/{pg}/"
+		},
+    {
+			"title": "漫剧",
+			"url0": "https://huangguoai.com/ai-manju/",
+			"url1": "https://huangguoai.com/ai-manju/{pg}/"
+		},
+    {
+			"title": "换脸",
+			"url0": "https://huangguoai.com/ai-huanlian/",
+			"url1": "https://huangguoai.com/ai-huanlian/{pg}/"
+		},
+    {
+			"title": "魔改",
+			"url0": "https://huangguoai.com/ai-mogai/",
+			"url1": "https://huangguoai.com/ai-mogai/{pg}/"
+		}
+	],  
+"vod_node":"//main//div[contains(@class, 'hg-card-grid is-active')]//div[@class='hg-drama-card']",
+"vod_info":"//span[@class='hg-drama-card__episode']",
+"vod_score":"//span[@class='hg-drama-card__score']",
+"vod_title":"//h3/a",
+"vod_image_id":"//img/@data-src",
+"vod_image_regex":"",
+"vod_image_url":"{id}",
+"vod_link_id":"//h3/a/@href",
+"vod_link_url":"https://huangguoai.com{id}",
+"play_regex":"",
+"play_url":"{id}",
+"playlist_flag":true,
+"playlist_group_node":"//div[@class='hg-play__episodes']",
+"playlist_title":"//a",
+"playlist_link_id":"//a/@href",
+"playlist_link_url":"https://huangguoai.com{id}",
+"playlist_info":"//p[@class='hg-play__panel-desc']",
+"search_flag":true,
+"search_url_first_page":"https://huangguoai.com/search/video/{wd}",
+"search_url_other_page":"https://huangguoai.com/search/video/{wd}/{pg}/",
+"search_vod_node":"//div[@class='hg-card-grid']//div[@class='hg-drama-card']",
+"search_vod_title":"//h3/a",
+"search_vod_image_id":"//img/@data-src",
+"search_vod_image_regex":"",
+"search_vod_image_url":"{id}",
+"search_vod_link_id":"//h3/a/@href",
+"search_vod_link_url":"https://huangguoai.com{id}"
+}

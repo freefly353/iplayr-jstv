@@ -1,0 +1,73 @@
+{
+"uuid":"6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2",
+"title":"厂长资源",
+"episode_flag":true,
+"landscape_flag":false,
+"referer":"",
+"cf_flag":true,
+"open_with_safari_flag":true,
+"category": [{
+			"title": "最新电影",
+			"url0": "https://www.4kcz.com/zuixindianying",
+			"url1": "https://www.4kcz.com/zuixindianying/page/{pg}"
+		},
+		{
+			"title": "美剧",
+			"url0": "https://www.4kcz.com/meijutt",
+			"url1": "https://www.4kcz.com/meijutt/page/{pg}"
+		},
+			{
+			"title": "日剧",
+			"url0": "https://www.4kcz.com/riju",
+			"url1": "https://www.4kcz.com/riju/page/{pg}"
+		},
+     {
+			"title": "国产剧",
+			"url0": "https://www.4kcz.com/gcj",
+			"url1": "https://www.4kcz.com/gcj/page/{pg}"
+		},
+                  {
+			"title": "韩剧",
+			"url0": "https://www.4kcz.com/hanjutv",
+			"url1": "https://www.4kcz.com/hanjutv/page/{pg}"
+		},
+                  {
+			"title": "番剧",
+			"url0": "https://www.4kcz.com/fanju",
+			"url1": "https://www.4kcz.com/fanju/page/{pg}"
+		},
+                  {
+			"title": "动漫",
+			"url0": "https://www.4kcz.com/dm",
+			"url1": "https://www.4kcz.com/dm/page/{pg}"
+		}
+	],    
+
+"vod_node":"//div[@class='bt_img mi_ne_kd mrb']//ul//li",
+"vod_info":"//span[@class='furk']",
+"vod_score":"",
+"vod_title":"//h3/a",
+"vod_image_id":"//img/@data-original",
+"vod_image_regex":"",
+"vod_image_url":"{id}",
+"vod_link_id":"//h3/a/@href",
+"vod_link_url":"{id}",
+"play_regex":"",
+"play_url":"",
+"playlist_flag":true,
+"playlist_group_node":"//div[@class='paly_list_btn']",
+"playlist_title":"//a",
+"playlist_link_id":"//a/@href",
+"playlist_link_url":"{id}",
+"playlist_info":"//div[@class='yp_context']",
+"search_flag":true,
+"search_url_first_page":"https://www.4kcz.com/nimasile?q={wd}",
+"search_url_other_page":"https://www.4kcz.com/nimasile?q={wd}&f=_all&p={pg}",
+"search_vod_node":"//div[@class='bt_img mi_ne_kd search_list']//ul//li",
+"search_vod_title":"//h3/a",
+"search_vod_image_id":"//img/@src",
+"search_vod_image_regex":"",
+"search_vod_image_url":"{id}",
+"search_vod_link_id":"//h3/a/@href",
+"search_vod_link_url":"https://www.4kcz.com{id}"
+}
