@@ -672,6 +672,34 @@ function applyRegex(text, pattern) {
     }
 }
 
+// MacCMS 播放页 player_aaaa 解码（encrypt: 0 明文 / 1 unescape / 2 base64+unescape）
+// 解出的是媒体地址才返回，否则 null（encrypt=3 等自定义加密走嗅探兜底）
+function decodePlayerAaaa(html) {
+    if (!isStr(html)) return null;
+    const m =
+        /player_aaaa\s*=\s*(\{.*?\})\s*;?\s*<\/script>/s.exec(html) ||
+        /player_aaaa\s*=\s*(\{[^\n]*\})/.exec(html);
+    if (!m) return null;
+    let d;
+    try {
+        d = JSON.parse(m[1]);
+    } catch (_) {
+        return null;
+    }
+    let url = toStr(d.url);
+    if (!url) return null;
+    const enc = String(d.encrypt ?? "0");
+    try {
+        if (enc === "1") url = decodeURIComponent(url);
+        else if (enc === "2") url = decodeURIComponent(Buffer.from(url, "base64").toString("utf8"));
+        else if (enc !== "0") return null;
+    } catch (_) {
+        return null;
+    }
+    if (/\.(m3u8|mp4|flv|mkv|mpd|ts)(\?|#|$)/i.test(url) || /m3u8/i.test(url)) return url;
+    return null;
+}
+
 // ---------- HTTP ----------
 
 const DEFAULT_UA =
@@ -684,6 +712,23 @@ async function fetchText(url, headers, timeoutMs) {
         const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
         const text = await resp.text();
         return { status: resp.status, text, finalUrl: resp.url || url };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function fetchBinary(url, headers, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 30000);
+    try {
+        const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
+        const buf = Buffer.from(await resp.arrayBuffer());
+        return {
+            status: resp.status,
+            body: buf,
+            contentType: resp.headers.get("content-type") || "application/octet-stream",
+            finalUrl: resp.url || url,
+        };
     } finally {
         clearTimeout(timer);
     }
@@ -988,6 +1033,62 @@ function createIPlayrSpider(rule, opts) {
         return h;
     }
 
+    // ---------- HLS 本地代理 ----------
+    // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
+    // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
+    // 播放器只跟 127.0.0.1 打交道。
+    const PROXY_BUILD = "iplayr-proxy-v1";
+    let proxyBase = "http://127.0.0.1:9988";
+    const diagLog = [];
+    function diagPush(action, info) {
+        try {
+            diagLog.push(Object.assign({ t: new Date().toISOString().slice(11, 19), action }, info));
+            while (diagLog.length > 50) diagLog.shift();
+        } catch (_) {}
+    }
+    function proxyUrlFor(action, upstream) {
+        return (
+            proxyBase +
+            "/spider/" +
+            encodeURIComponent(opts.key || "iplayr") +
+            "/3/proxy/" +
+            action +
+            "?u=" +
+            encodeURIComponent(upstream)
+        );
+    }
+    function isHlsUrl(u) {
+        return /\.m3u8(\?|#|$)/i.test(toStr(u)) || /m3u8/i.test(toStr(u));
+    }
+    function rewritePlaylist(text, upstreamUrl) {
+        const lines = String(text || "").split(/\r?\n/);
+        const out = [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line) { out.push(line); continue; }
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                out.push(line);
+                if (i + 1 < lines.length && lines[i + 1] && !lines[i + 1].startsWith("#")) {
+                    out.push(proxyUrlFor("pl.m3u8", resolveUrl(lines[i + 1].trim(), upstreamUrl)));
+                    i++;
+                }
+                continue;
+            }
+            if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP") || line.startsWith("#EXT-X-MEDIA")) {
+                out.push(
+                    line.replace(/URI="([^"]+)"/g, (m, uri) => {
+                        const abs = resolveUrl(uri, upstreamUrl);
+                        return 'URI="' + proxyUrlFor(line.startsWith("#EXT-X-MEDIA") ? "pl.m3u8" : "seg", abs) + '"';
+                    })
+                );
+                continue;
+            }
+            if (line.startsWith("#")) { out.push(line); continue; }
+            out.push(proxyUrlFor("seg", resolveUrl(line.trim(), upstreamUrl)));
+        }
+        return out.join("\n");
+    }
+
     // 从列表响应提取条目（JSON / HTML 两路）
     function extractItems(text, pageUrl, f) {
         // f: {node, title, imageId, imageRegex, imageUrl, linkId, info, score}
@@ -1073,7 +1174,9 @@ function createIPlayrSpider(rule, opts) {
             filterable: 0,
         },
 
-        setProxyBase() {},
+        setProxyBase(url) {
+            if (typeof url === "string" && url) proxyBase = url.replace(/\/+$/, "");
+        },
 
         init() {},
 
@@ -1230,6 +1333,8 @@ function createIPlayrSpider(rule, opts) {
         async play(flag, id) {
             const pid = toStr(id);
             const header = playHeaders();
+            // HLS 地址走本地代理（spider 带浏览器 UA 拉上游，避开 UA 拦截）
+            const wrap = (u) => (isHlsUrl(u) ? proxyUrlFor("pl.m3u8", u) : u);
             // JSON TV 型：id 是单集接口，再取 sources
             if (isStr(R.play_node)) {
                 const { text, finalUrl } = await fetchText(pid, reqHeaders());
@@ -1241,24 +1346,42 @@ function createIPlayrSpider(rule, opts) {
                         const sid = jsonField(s, data, R.play_link_id);
                         if (!sid) continue;
                         const url = resolveUrl(fillTemplate(R.play_source_url || "{id}", { id: sid }), finalUrl);
-                        if (url) return { parse: 0, url, header };
+                        if (url) return { parse: 0, url: wrap(url), header };
                     }
                 }
-                return { parse: 0, url: pid, header };
+                return { parse: 0, url: wrap(pid), header };
             }
-            // HTML 型：id 是播放页，play_regex 抠真实地址
-            if (isStr(R.play_regex)) {
-                const { text, finalUrl } = await fetchText(pid, reqHeaders());
-                const cap = applyRegex(text, decodeRuleRegex(R.play_regex));
-                if (cap) {
-                    const url = resolveUrl(fillTemplate(R.play_url || "{id}", { id: cap }), finalUrl);
-                    return { parse: 0, url, header };
+            // id 本身已是媒体地址：不用抓页（HLS 仍走代理）
+            if (/\.(m3u8|mp4|flv|mkv|mpd|ts)(\?|#|$)/i.test(pid)) {
+                return { parse: 0, url: wrap(pid), header };
+            }
+            // 抓播放页：依次试 规则正则 → MacCMS player_aaaa 解码 → 页面直链
+            let pageText = "";
+            let pageUrl = pid;
+            try {
+                const resp = await fetchText(pid, reqHeaders());
+                pageText = resp.text;
+                pageUrl = resp.finalUrl;
+            } catch (_) { /* 抓页失败走嗅探兜底 */ }
+            if (pageText) {
+                // 抓到的本身就是 m3u8 清单（如 dexter 接口）：走代理交给播放器
+                if (pageText.trimStart().startsWith("#EXTM3U")) {
+                    return { parse: 0, url: proxyUrlFor("pl.m3u8", pid), header };
                 }
-                return { parse: 1, url: pid, header };
+                if (isStr(R.play_regex)) {
+                    const cap = applyRegex(pageText, decodeRuleRegex(R.play_regex));
+                    if (cap) {
+                        const url = resolveUrl(fillTemplate(R.play_url || "{id}", { id: cap }), pageUrl);
+                        return { parse: 0, url: wrap(url), header };
+                    }
+                }
+                const pa = decodePlayerAaaa(pageText);
+                if (pa) return { parse: 0, url: wrap(resolveUrl(pa, pageUrl)), header };
+                const direct = /(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)/i.exec(pageText);
+                if (direct) return { parse: 0, url: wrap(direct[1]), header };
             }
-            // 已是媒体地址直接播；否则是播放页，交给播放器嗅探（parse:1）
-            const isMedia = /\.(m3u8|mp4|flv|mkv|mpd|ts)(\?|#|$)/i.test(pid) || /m3u8/i.test(pid);
-            return { parse: isMedia ? 0 : 1, url: pid, header };
+            // 抠不到真实地址：交给播放器嗅探
+            return { parse: 1, url: pid, header };
         },
 
         async search(wd, quick, pg) {
@@ -1277,8 +1400,53 @@ function createIPlayrSpider(rule, opts) {
             };
         },
 
-        proxy() {
-            return [404, "text/plain", "not found", {}];
+        async proxy(params) {
+            let query = params;
+            if (typeof query === "string") {
+                query = {};
+                for (const pair of String(params).split("&")) {
+                    const [k, v] = pair.split("=");
+                    if (k) query[decodeURIComponent(k)] = v ? decodeURIComponent(v) : "";
+                }
+            }
+            query = query || {};
+            let action = String(query.do || query.action || "").replace(/\.(m3u8|ts|m4s)$/i, "");
+            if (action === "diag") {
+                const body = JSON.stringify({ version: PROXY_BUILD, diag: diagLog.slice().reverse() }, null, 1);
+                return [200, "application/json", body, { "Content-Type": "application/json" }];
+            }
+            const u = toStr(query.u);
+            if (!u) {
+                return [400, "application/json", JSON.stringify({ error: "missing u" }), { "Content-Type": "application/json" }];
+            }
+            if (action === "pl") {
+                try {
+                    const resp = await fetchText(u, reqHeaders());
+                    diagPush("pl", { status: resp.status, ok: resp.status === 200 && !!resp.text, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.text) {
+                        return [502, "text/plain", "upstream playlist error", { "Content-Type": "text/plain" }];
+                    }
+                    const rewritten = rewritePlaylist(resp.text, resp.finalUrl);
+                    return [200, "application/vnd.apple.mpegurl", rewritten, { "Content-Type": "application/vnd.apple.mpegurl" }];
+                } catch (e) {
+                    diagPush("pl", { status: 0, ok: false, err: String((e && e.message) || e).slice(0, 60) });
+                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
+                }
+            }
+            if (action === "seg") {
+                try {
+                    const resp = await fetchBinary(u, reqHeaders());
+                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && resp.body.length > 0, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.body.length) {
+                        return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
+                    }
+                    return [200, resp.contentType, resp.body, { "Content-Type": resp.contentType }];
+                } catch (e) {
+                    diagPush("seg", { status: 0, ok: false, err: String((e && e.message) || e).slice(0, 60) });
+                    return [502, "application/json", JSON.stringify({ error: String((e && e.message) || e).slice(0, 200) }), { "Content-Type": "application/json" }];
+                }
+            }
+            return [404, "text/plain", "unknown proxy action", { "Content-Type": "text/plain" }];
         },
 
         destroy() {},
@@ -1290,9 +1458,9 @@ function createIPlayrSpider(rule, opts) {
 return createIPlayrSpider;
 })();
 
-const RULE_0 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "123av", "episode_flag": false, "landscape_flag": true, "referer": "https://sadie-shop.site/", "open_with_safari_flag": true, "category": [{"title": "新作上市", "url0": "https://123av.com/cn/new", "url1": "https://123av.com/cn/new?page={pg}"}, {"title": "最近更新", "url0": "https://123av.com/cn/recent", "url1": "https://123av.com/cn/recent?page={pg}"}], "vod_node": "//div[@class='card']", "vod_info": "//span[@class='card__dur']", "vod_score": "//div[@class='card__meta']/span", "vod_title": "//h3//a", "vod_image_id": "//div[@class='card__poster']/@data-preview", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3//a/@href", "vod_link_url": "https://123av.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://123av.com/cn/search?keyword={wd}", "search_url_other_page": "https://123av.com/cn/search?keyword={wd}&page={pg}", "search_vod_node": "//div[@class='card']", "search_vod_title": "//h3//a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3//a/@href", "search_vod_link_url": "https://123av.com{id}"};
+const RULE_0 = {"uuid": "76d49e34-b2ef-4b9d-911f-77c445c63940", "title": "stream movie", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": false, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1", "pageSize": 1, "category": [{"title": "movie", "url0": "https://dexter.pw/api/browse?type=movie&page=1&site=dexter", "url1": "https://dexter.pw/api/browse?type=movie&page={pg}&site=dexter"}], "vod_node": "$.results[*]", "vod_info": "year", "vod_score": "rating", "vod_title": "title", "vod_image_id": "poster", "vod_image_url": "https://image.tmdb.org/t/p/w500{id}", "vod_link_id": "id", "vod_link_url": "https://dexter.pw/api/movie/{id}?site=dexter", "playlist_flag": true, "playlist_group_node": "$.sources[*]", "playlist_title": "label", "playlist_info": "$.overview", "playlist_link_id": "url", "playlist_link_url": "https://dexter.pw{id}", "search_flag": false, "search_url_first_page": "https://dexter.pw/api/search?q={wd}&type=all&page=1&site=dexter", "search_url_other_page": "https://dexter.pw/api/search?q={wd}&type=all&page={pg}&site=dexter", "search_vod_node": "$.results[*]", "search_vod_title": "title", "search_vod_image_id": "poster", "search_vod_image_url": "https://image.tmdb.org/t/p/w500{id}", "search_vod_link_id": "id", "search_vod_link_url": "https://dexter.pw/api/tv/{id}"};
 function ip0(e){
-const core=createIPlayrSpider(RULE_0,{key:"ip_123"});
+const core=createIPlayrSpider(RULE_0,{key:"ip_stream_movie"});
 const spider={
 meta:core.meta,
 setProxyBase(url){return core.setProxyBase(url);},
@@ -1310,1887 +1478,7 @@ destroy(){return core.destroy();}
 return spider;
 }
 
-const RULE_1 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "134x", "episode_flag": false, "landscape_flag": true, "referer": "", "cf_flag": true, "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15", "category": [{"title": "home", "url0": "https://134x.com/", "url1": "https://134x.com/?page={pg}"}], "vod_node": "//div[@class='tweet-card-shell']", "vod_info": "//time", "vod_score": "", "vod_title": "//p[@class='tweet-text']", "vod_image_id": "//video/@poster", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='tweet-source-links']//a/@href", "vod_link_url": "https://134x.com{id}", "play_regex": "dGFnPTE2IjoiKGh0dHBbXiJdKw==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip1(e){
-const core=createIPlayrSpider(RULE_1,{key:"ip_134"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_2 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "24hjav", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://24hjav.com/videos/latest?page_id=1", "url1": "https://24hjav.com/videos/latest?page_id={pg}"}], "vod_node": "//div[contains(@class, 'videos-latest-list')]//div[contains(@class, 'video-latest-list')]", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='video-title']//a//h4", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='video-title']/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://24hjav.com/search?keyword={wd}", "search_url_other_page": "https://24hjav.com/search?keyword={wd}&page_id={pg}", "search_vod_node": "//div[contains(@class, 'videos-latest-list')]//div[contains(@class, 'video-latest-list')]", "search_vod_title": "//div[@class='video-title']//a//h4", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='video-title']/a/@href", "search_vod_link_url": "{id}"};
-function ip2(e){
-const core=createIPlayrSpider(RULE_2,{key:"ip_24hjav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_3 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "4Kmp", "episode_flag": true, "landscape_flag": false, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1", "referer": "https://4k-av.com/", "open_with_safari_flag": false, "category": [{"title": "剧集", "url0": "https://4k-av.com/tv/", "url1": "https://4k-av.com/tv/page-{pg}.html"}, {"title": "电影", "url0": "https://4k-av.com/movie/", "url1": "https://4k-av.com/movie/page-{pg}.html"}], "vod_node": "//div[@id='page']//div[@class='NTMitem']", "vod_info": "//label[@title='年份']", "vod_score": "//label[@title='分辨率']", "vod_title": "//div[@class='title']/a", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='title']/a/@href", "vod_link_url": "https://4k-av.com{id}", "play_regex": "PHNvdXJjZSBzcmM9IihbXiJdKyk=", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[@id='rtlist']", "playlist_title": "//li//a/@title", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://4k-av.com{id}", "playlist_info": "//p[@class='cnline']", "search_flag": true, "search_url_first_page": "https://4k-av.com/s?k={wd}", "search_url_other_page": "https://4k-av.com/s?k={wd}&page={pg}", "search_vod_node": "//div[@id='MainContent_newestlist']//div[@class='NTMitem Main']", "search_vod_title": "//div[@class='title']/a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='title']/a/@href", "search_vod_link_url": "https://4k-av.com{id}"};
-function ip3(e){
-const core=createIPlayrSpider(RULE_3,{key:"ip_4kav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_4 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "4k beer", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://4k.beer/movies?filter=[]&page=1", "url1": "https://4k.beer/movies?filter=[]&page={pg}"}, {"title": "剧集", "url0": "https://4k.beer/show?filter=[]&page=1", "url1": "https://4k.beer/show?filter=[]&page={pg}"}, {"title": "anime", "url0": "https://4k.beer/anime?filter=null&page=1", "url1": "https://4k.beer/anime?filter=null&page={pg}"}], "vod_node": "//div[@class='list-movie']", "vod_info": "", "vod_score": "//div[@class='imdb']", "vod_title": "//div[@class='list-caption']", "vod_image_id": "//div[@class='media media-cover']/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "//div[@class='module-play-list']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.dadaqu.cc{id}", "playlist_info": "//div[@class='module-info-introduction-content']", "search_flag": false, "search_url_first_page": "https://www.dadaqu.cc/search/-------------.html?wd={wd}", "search_url_other_page": "https://www.dadaqu.cc/search/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='module-card-item module-item']//div[@class='module-card-item module-item']", "search_vod_title": "//div[@class='module-card-item-title']//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']//a/@href", "search_vod_link_url": "https://www.dadaqu.cc{id}"};
-function ip4(e){
-const core=createIPlayrSpider(RULE_4,{key:"ip_4kbeer"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_5 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "4K影视", "episode_flag": true, "landscape_flag": false, "referer": "", "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://www.4kvm.cc/filter", "url1": "https://www.4kvm.cc/filter?page={pg}"}], "vod_node": "//div[contains(@class, 'movie-card')]", "vod_info": "//span[@class='text-white drop-shadow-md']", "vod_score": "", "vod_title": "//h3", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.4kvm.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='grid grid-cols-6 gap-2']", "playlist_title": "//a/@data-episode", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.4kvm.cc{id}", "playlist_info": "//p[@class='text-xs text-gray-300 leading-relaxed']", "search_flag": true, "search_url_first_page": "https://www.4kvm.cc/search?q={wd}", "search_url_other_page": "", "search_vod_node": "//div[@class='group relative']", "search_vod_title": "//h3", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://www.4kvm.cc{id}"};
-function ip5(e){
-const core=createIPlayrSpider(RULE_5,{key:"ip_4kvm_movie"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_6 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "7mmtv", "episode_flag": false, "landscape_flag": true, "referer": "https://7mmtv.sx/", "open_with_safari_flag": true, "category": [{"title": "有码", "url0": "https://7mmtv.sx/zh/censored_list/all/1.html", "url1": "https://7mmtv.sx/zh/censored_list/all/{pg}.html"}, {"title": "无码", "url0": "https://7mmtv.sx/zh/uncensored_list/all/1.html", "url1": "https://7mmtv.sx/zh/uncensored_list/all/{pg}.html"}, {"title": "素人", "url0": "https://7mmtv.sx/zh/amateurjav_list/all/1.html", "url1": "https://7mmtv.sx/zh/amateurjav_list/all/{pg}.html"}, {"title": "中字", "url0": "https://7mmtv.sx/zh/chinese_list/all/1.html", "url1": "https://7mmtv.sx/zh/chinese_list/all/{pg}.html"}, {"title": "国产", "url0": "https://7mmtv.sx/zh/amateur_list/all/1.html", "url1": "https://7mmtv.sx/zh/amateur_list/all/{pg}.html"}], "vod_node": "//div[contains(@class, 'content')]//div[@class='video']", "vod_info": "//span[contains(@class, 'text-muted')]", "vod_score": "", "vod_title": "//h3/a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://7mmtv.sx/zh/searchall_search/all/{wd}/1.html", "search_url_other_page": "https://7mmtv.sx/zh/searchall_search/all/{wd}/{pg}.html", "search_vod_node": "//div[contains(@class, 'content')]//div[@class='video']", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "{id}"};
-function ip6(e){
-const core=createIPlayrSpider(RULE_6,{key:"ip_7mm"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_7 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "91pron.men", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "黑暗", "url0": "https://91pron.men/vodtype/27.html", "url1": "https://91pron.men/vodtype/27-{pg}.html"}, {"title": "伦理", "url0": "https://91pron.men/vodtype/28.html", "url1": "https://91pron.men/vodtype/28-{pg}.html"}, {"title": "偷拍", "url0": "https://91pron.men/vodtype/29.html", "url1": "https://91pron.men/vodtype/29-{pg}.html"}, {"title": "学生", "url0": "https://91pron.men/vodtype/30.html", "url1": "https://91pron.men/vodtype/30-{pg}.html"}, {"title": "社交", "url0": "https://91pron.men/vodtype/31.html", "url1": "https://91pron.men/vodtype/31-{pg}.html"}, {"title": "传媒", "url0": "https://91pron.men/vodtype/32.html", "url1": "https://91pron.men/vodtype/32-{pg}.html"}, {"title": "日韩", "url0": "https://91pron.men/vodtype/33.html", "url1": "https://91pron.men/vodtype/33-{pg}.html"}], "vod_node": "//div[@class='thumbnail group']", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='my-2 text-sm text-nord4 truncate']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='my-2 text-sm text-nord4 truncate']/a/@href", "vod_link_url": "https://91pron.men{id}", "play_regex": "InVybCI6IihbXiJdKyk=", "play_url": "https://91pron.men{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://91pron.men/search.html?wd={wd}", "search_url_other_page": "https://91pron.men/search{wd}/page/{pg}.html", "search_vod_node": "//div[@class='my-2 text-sm text-nord4 truncate']", "search_vod_title": "//div[@class='my-2 text-sm text-nord4 truncate']", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='my-2 text-sm text-nord4 truncate']/a/@href", "search_vod_link_url": "https://91pron.men{id}"};
-function ip7(e){
-const core=createIPlayrSpider(RULE_7,{key:"ip_91pronmen"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_8 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "风铃动漫", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "番剧", "url0": "https://www.bbfun.cc/feng-f/0CCCCS.html", "url1": "https://www.bbfun.cc/feng-f/0CCCCS-{pg}.html"}, {"title": "剧场", "url0": "https://www.bbfun.cc/feng-f/HCCCCS.html", "url1": "https://www.bbfun.cc/feng-f/HCCCCS-{pg}.html"}], "vod_node": "//ul[contains(@class, 'hl-vod-list')]//li", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='hl-item-text']//a", "vod_image_id": "//a[@class='hl-item-thumb hl-lazy']/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='hl-item-text']//a/@href", "vod_link_url": "https://www.bbfun.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'hl-plays-list')]", "playlist_title": "//li/a", "playlist_link_id": "//li/a/@href", "playlist_link_url": "https://www.bbfun.cc{id}", "playlist_info": "//span[@class='hl-content-text']", "search_flag": true, "search_url_first_page": "https://www.bbfun.cc/feng-s.html?wd={wd}&submit=", "search_url_other_page": "https://www.bbfun.cc/feng-s/page/{pg}/wd/{wd}.html", "search_vod_node": "//ul[contains(@class, 'hl-one-list')]//li", "search_vod_title": "//div[contains(@class, 'hl-item-title')]//a", "search_vod_image_id": "//a[@class='hl-item-thumb hl-lazy']/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[contains(@class, 'hl-item-title')]//a/@href", "search_vod_link_url": "https://www.bbfun.cc{id}"};
-function ip8(e){
-const core=createIPlayrSpider(RULE_8,{key:"ip_aafun"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_9 = {"uuid": "76d49e34-b2ef-4b9d-911f-77c445c63940", "title": "allav", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": false, "pageSize": 25, "category": [{"title": "最近更新", "url0": "https://pigav.ws/api/v1/videos?start=0&count=25&sort=-publishedAt", "url1": "https://pigav.ws/api/v1/videos?start={start}&count={count}&sort=-publishedAt"}, {"title": "亚洲", "url0": "https://pigav.ws/api/v1/videos?start=0&count=25&sort=-publishedAt&skipCount=true&categoryOneOf=21&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0", "url1": "https://pigav.ws/api/v1/videos?start={start}&count={count}&sort=-publishedAt&skipCount=true&categoryOneOf=21&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0"}, {"title": "日韩", "url0": "https://pigav.ws/api/v1/videos?start=0&count=25&sort=-publishedAt&skipCount=true&categoryOneOf=20&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0", "url1": "https://pigav.ws/api/v1/videos?start={start}&count={count}&sort=-publishedAt&skipCount=true&categoryOneOf=20&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0"}, {"title": "自拍", "url0": "https://pigav.ws/api/v1/videos?start=0&count=25&sort=-publishedAt&skipCount=true&categoryOneOf=22&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0", "url1": "https://pigav.ws/api/v1/videos?start={start}&count={count}&sort=-publishedAt&skipCount=true&categoryOneOf=22&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0"}, {"title": "欧美", "url0": "https://pigav.ws/api/v1/videos?start=0&count=25&sort=-publishedAt&skipCount=true&categoryOneOf=23&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0", "url1": "https://pigav.ws/api/v1/videos?start={start}&count={count}&sort=-publishedAt&skipCount=true&categoryOneOf=23&nsfw=both&nsfwFlagsExcluded=0&nsfwFlagsIncluded=0"}], "vod_node": "$.data[*]", "vod_info": "publishedAt", "vod_score": "", "vod_title": "name", "vod_image_id": "previewPath", "vod_image_url": "{id}", "vod_link_id": "shortUUID", "vod_link_url": "https://pigav.ws/api/v1/videos/{id}", "playlist_flag": true, "playlist_group_node": "$.streamingPlaylists[*].files[*]", "playlist_title": "$.resolution.label", "playlist_link_id": "$.playlistUrl", "playlist_link_url": "{id}", "playlist_info": "$.description", "search_flag": true, "search_url_first_page": "https://pigav.ws/api/v1/search/videos?start=0&count=20&search={wd}&sort=-match&searchTarget=local&nsfw=both&nsfwFlagsIncluded=0", "search_url_other_page": "https://pigav.ws/api/v1/search/videos?start={start}&count={count}&search={wd}&sort=-match&searchTarget=local&nsfw=both&nsfwFlagsIncluded=0", "search_vod_node": "$.data[*]", "search_vod_title": "name", "search_vod_image_id": "previewPath", "search_vod_image_url": "{id}", "search_vod_link_id": "shortUUID", "search_vod_link_url": "{id}"};
-function ip9(e){
-const core=createIPlayrSpider(RULE_9,{key:"ip_allav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_10 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "av01", "episode_flag": false, "landscape_flag": true, "referer": "https://www.av01.media/", "open_with_safari_flag": true, "cf_flag": true, "category": [{"title": "最近更新", "url0": "https://www.av01.media/cn/videos/latest", "url1": "https://www.av01.media/cn/videos/latest?page={pg}"}], "vod_node": "//main//div[@class='group']", "vod_info": "", "vod_score": "//div[@class='duration']", "vod_title": "//h3", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.av01.media{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://www.av01.media/cn/search?q={wd}", "search_url_other_page": "https://www.av01.media/cn/search?q={wd}&page={pg}", "search_vod_node": "//main//div[@class='group']", "search_vod_title": "//h3", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://www.av01.media{id}"};
-function ip10(e){
-const core=createIPlayrSpider(RULE_10,{key:"ip_av01"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_11 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "avbebe", "episode_flag": false, "landscape_flag": true, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "高清中字", "url0": "https://avbebe.com/archives/category/%e9%ab%98%e6%b8%85%e4%b8%ad%e5%ad%97", "url1": "https://avbebe.com/archives/category/%e9%ab%98%e6%b8%85%e4%b8%ad%e5%ad%97/page/{pg}"}, {"title": "高清素人", "url0": "https://avbebe.com/archives/category/%e9%ab%98%e6%b8%85%e7%b4%a0%e4%ba%ba", "url1": "https://avbebe.com/archives/category/%e9%ab%98%e6%b8%85%e7%b4%a0%e4%ba%ba/page/{pg}"}, {"title": "馬賽克破解", "url0": "https://avbebe.com/archives/category/%e9%a6%ac%e8%b3%bd%e5%85%8b%e7%a0%b4%e8%a7%a3", "url1": "https://avbebe.com/archives/category/%e9%a6%ac%e8%b3%bd%e5%85%8b%e7%a0%b4%e8%a7%a3/page/{pg}"}, {"title": "華語AV", "url0": "https://avbebe.com/archives/category/%e8%8f%af%e8%aa%9eav", "url1": "https://avbebe.com/archives/category/%e8%8f%af%e8%aa%9eav/page/{pg}"}, {"title": "綜合AV", "url0": "https://avbebe.com/archives/category/%e7%b6%9c%e5%90%88av", "url1": "https://avbebe.com/archives/category/%e7%b6%9c%e5%90%88av/page/{pg}"}, {"title": "新番", "url0": "https://avbebe.com/archives/category/new", "url1": "https://avbebe.com/archives/category/new/page/{pg}"}, {"title": "動畫卡通", "url0": "https://avbebe.com/archives/category/h%e5%8b%95%e7%95%ab%e5%bd%b1%e7%89%87", "url1": "https://avbebe.com/archives/category/h%e5%8b%95%e7%95%ab%e5%bd%b1%e7%89%87/page/{pg}"}], "vod_node": "//div[contains(@class, 'jeg_block_container')]//article", "vod_info": "", "vod_score": "", "vod_title": "//h3/a", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://avbebe.com/?s={wd}", "search_url_other_page": "https://avbebe.com/page/{pg}?s={wd}", "search_vod_node": "//div[contains(@class, 'jnews_category_content_wrapper')]//article", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "{id}"};
-function ip11(e){
-const core=createIPlayrSpider(RULE_11,{key:"ip_avbebe"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_12 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "avstime", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "国产", "url0": "https://avstime.com/vodtype/20/", "url1": "https://avstime.com/vodtype/20-{pg}"}, {"title": "日本无码", "url0": "https://avstime.com/vodtype/22/", "url1": "https://avstime.com/vodtype/22-{pg}"}, {"title": "日本有码", "url0": "https://avstime.com/vodtype/21/", "url1": "https://avstime.com/vodtype/21-{pg}"}, {"title": "欧美", "url0": "https://avstime.com/vodtype/22/", "url1": "https://avstime.com/vodtype/22-{pg}"}], "vod_node": "//div[contains(@id, 'new_cover')]//a[contains(@class, 'videoBox')]", "vod_info": "", "vod_score": "", "vod_title": "//h4", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://avstime.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://avstime.com/vodsearch/-------------/?wd={wd}", "search_url_other_page": "", "search_vod_node": "//div[contains(@id, 'new_cover')]//a[contains(@class, 'videoBox')]", "search_vod_title": "//h4", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://avstime.com{id}"};
-function ip12(e){
-const core=createIPlayrSpider(RULE_12,{key:"ip_avstime"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_13 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "bad.news av", "episode_flag": false, "landscape_flag": true, "info": "已失效", "referer": "", "category": [{"title": "新作上市", "url0": "https://bad.news/av/release", "url1": "https://bad.news/av/release/page-{pg}"}], "vod_node": "//div[@class='twi hasMedia link']", "vod_info": "//span[@class='time intotime']", "vod_score": "//div[@class='ct-time']", "vod_title": "//h3/a", "vod_image_id": "//video/@poster", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "https://bad.news{id}", "play_regex": "ImNvbnRlbnRVcmwiOiAiKFteIl0rKQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://bad.news/av/search/q-{wd}", "search_url_other_page": "https://bad.news/av/search/q-{wd}/page-{pg}", "search_vod_node": "//div[@class='entry']", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-echo", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "https://bad.news{id}"};
-function ip13(e){
-const core=createIPlayrSpider(RULE_13,{key:"ip_badnewav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_14 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "bad.news长视频", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": false, "cf_flag": true, "category": [{"title": "长视频", "url0": "https://bad.news/tag/long-porn", "url1": "https://bad.news/tag/long-porn/page-{pg}"}, {"title": "短视频", "url0": "https://bad.news/tag/porn/sort-new", "url1": "https://bad.news/tag/porn/sort-new/page-{pg}"}], "vod_node": "//div[contains(@class, 'show')]", "vod_info": "//label[@style='color:#989898;']", "vod_score": "", "vod_title": "//h3//a", "vod_image_id": "//video/@poster", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "https://bad.news{id}", "play_regex": "cHJlbG9hZD0iYXV0byIgZGF0YS1zb3VyY2U9IihbXiJdKyk=", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip14(e){
-const core=createIPlayrSpider(RULE_14,{key:"ip_badnews_long"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_15 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "磁力熊", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.cilixiong.org/movie/", "url1": "https://www.cilixiong.org/movie/index_{pg}.html"}, {"title": "剧集", "url0": "https://www.cilixiong.org/drama/", "url1": "https://www.cilixiong.org/drama/index_{pg}.html"}], "vod_node": "//div[@class='container']//div[contains(@class, 'row-cols-2')]//div[@class='col']", "vod_info": "", "vod_score": "//span[contains(@class, 'rank')]", "vod_title": "//h2", "vod_image_id": "", "vod_image_regex": "c3R5bGU9ImJhY2tncm91bmQtaW1hZ2U6IHVybFwoJyhbXiddKyk=", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.cilixiong.org{id}", "play_regex": "", "play_url": "", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip15(e){
-const core=createIPlayrSpider(RULE_15,{key:"ip_cilixiong"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_16 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "厂长资源", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "最新电影", "url0": "https://www.4kcz.com/zuixindianying", "url1": "https://www.4kcz.com/zuixindianying/page/{pg}"}, {"title": "美剧", "url0": "https://www.4kcz.com/meijutt", "url1": "https://www.4kcz.com/meijutt/page/{pg}"}, {"title": "日剧", "url0": "https://www.4kcz.com/riju", "url1": "https://www.4kcz.com/riju/page/{pg}"}, {"title": "国产剧", "url0": "https://www.4kcz.com/gcj", "url1": "https://www.4kcz.com/gcj/page/{pg}"}, {"title": "韩剧", "url0": "https://www.4kcz.com/hanjutv", "url1": "https://www.4kcz.com/hanjutv/page/{pg}"}, {"title": "番剧", "url0": "https://www.4kcz.com/fanju", "url1": "https://www.4kcz.com/fanju/page/{pg}"}, {"title": "动漫", "url0": "https://www.4kcz.com/dm", "url1": "https://www.4kcz.com/dm/page/{pg}"}], "vod_node": "//div[@class='bt_img mi_ne_kd mrb']//ul//li", "vod_info": "//span[@class='furk']", "vod_score": "", "vod_title": "//h3/a", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "", "playlist_flag": true, "playlist_group_node": "//div[@class='paly_list_btn']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "{id}", "playlist_info": "//div[@class='yp_context']", "search_flag": true, "search_url_first_page": "https://www.4kcz.com/nimasile?q={wd}", "search_url_other_page": "https://www.4kcz.com/nimasile?q={wd}&f=_all&p={pg}", "search_vod_node": "//div[@class='bt_img mi_ne_kd search_list']//ul//li", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "https://www.4kcz.com{id}"};
-function ip16(e){
-const core=createIPlayrSpider(RULE_16,{key:"ip_cz"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_17 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "蛋蛋趣", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1", "category": [{"title": "电影", "url0": "https://www.dandanqu.cc/show/1-----------.html", "url1": "https://www.dandanqu.cc/show/1--------{pg}---.html"}, {"title": "剧集", "url0": "https://www.dandanqu.cc/show/2-----------.html", "url1": "https://www.dandanqu.cc/show/2--------{pg}---.html"}, {"title": "综艺", "url0": "https://www.dandanqu.cc/show/3-----------.html", "url1": "https://www.dandanqu.cc/show/3--------{pg}---.html"}, {"title": "动漫", "url0": "https://www.dandanqu.cc/show/4-----------.html", "url1": "https://www.dandanqu.cc/show/4--------{pg}---.html"}], "vod_node": "//div[contains(@class, 'module-items')]/a", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.dandanqu.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='module-play-list']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.dandanqu.cc{id}", "playlist_info": "//div[@class='module-info-introduction-content']", "search_flag": true, "search_url_first_page": "https://www.dandanqu.cc/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "https://www.dandanqu.cc/vodsearch/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='module-items module-card-items']//div[@class='module-card-item module-item']", "search_vod_title": "//div[@class='module-card-item-title']//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']//a/@href", "search_vod_link_url": "https://www.dandanqu.cc{id}"};
-function ip17(e){
-const core=createIPlayrSpider(RULE_17,{key:"ip_dandanqu"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_18 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "独播库", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "open_with_safari_flag": false, "category": [{"title": "电影", "url0": "https://www.dbku.tv/vodtype/1.html", "url1": "https://www.dbku.tv/vodshow/1--------{pg}---.html"}, {"title": "剧集", "url0": "https://www.dbku.tv/vodtype/2.html", "url1": "https://www.dbku.tv/vodshow/2--------{pg}---.html"}, {"title": "综艺", "url0": "https://www.dbku.tv/vodtype/3.html", "url1": "https://www.dbku.tv/vodshow/3--------{pg}---.html"}, {"title": "动漫", "url0": "https://www.dbku.tv/vodtype/4.html", "url1": "https://www.dbku.tv/vodshow/4--------{pg}---.html"}], "vod_node": "//ul[@class='myui-vodlist clearfix']//li", "vod_info": "//span[@class='pic-text text-right']", "vod_score": "//span[@class='tag']", "vod_title": "//h4//a", "vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h4//a/@href", "vod_link_url": "https://www.dbku.tv{id}", "play_regex": "InVybCI6IihbXiJdKyk=", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'myui-content__list')]", "playlist_title": "//li//a", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://www.dbku.tv{id}", "playlist_info": "//p[@class='data hidden-xs']", "search_flag": true, "search_url_first_page": "https://www.dbku.tv/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "", "search_vod_node": "//ul[@class='myui-vodlist__media clearfix']//li", "search_vod_title": "//h4//a", "search_vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4//a/@href", "search_vod_link_url": "https://www.dbku.tv{id}"};
-function ip18(e){
-const core=createIPlayrSpider(RULE_18,{key:"ip_dbk"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_19 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "达达趣", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.dadaqu.cc/show/1-----------.html", "url1": "https://www.dadaqu.cc/show/1--------{pg}---.html"}, {"title": "剧集", "url0": "https://www.dadaqu.cc/show/2-----------.html", "url1": "https://www.dadaqu.cc/show/2--------{pg}---.html"}, {"title": "综艺", "url0": "https://www.dadaqu.cc/show/3-----------.html", "url1": "https://www.dadaqu.cc/show/3--------{pg}---.html"}, {"title": "动漫", "url0": "https://www.dadaqu.cc/show/4-----------.html", "url1": "https://www.dadaqu.cc/show/4--------{pg}---.html"}], "vod_node": "//a[@class='module-poster-item module-item']", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.dadaqu.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='module-play-list']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.dadaqu.cc{id}", "playlist_info": "//div[@class='module-info-introduction-content']", "search_flag": true, "search_url_first_page": "https://www.dadaqu.cc/search/-------------.html?wd={wd}", "search_url_other_page": "https://www.dadaqu.cc/search/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='module-card-item module-item']//div[@class='module-card-item module-item']", "search_vod_title": "//div[@class='module-card-item-title']//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']//a/@href", "search_vod_link_url": "https://www.dadaqu.cc{id}"};
-function ip19(e){
-const core=createIPlayrSpider(RULE_19,{key:"ip_ddq"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_20 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "大米星球", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.dmxq.fun/vodshow/20-----------.html", "url1": "https://www.dmxq.fun/vodshow/20--------{pg}---.html"}, {"title": "电视", "url0": "https://www.dmxq.fun/vodshow/21-----------.html", "url1": "https://www.dmxq.fun/vodshow/21--------{pg}---.html"}, {"title": "动漫", "url0": "https://www.dmxq.fun/vodshow/22-----------.html", "url1": "https://www.dmxq.fun/vodshow/22--------{pg}---.html"}, {"title": "综艺", "url0": "https://www.dmxq.fun/vodshow/23-----------.html", "url1": "https://www.dmxq.fun/vodshow/23--------{pg}---.html"}], "vod_node": "//div[contains(@class, 'module-items')]/a", "vod_info": "", "vod_score": "//div[@class='module-item-douban']", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.dmxq.fun{id}", "play_regex": "", "play_url": "", "playlist_flag": true, "playlist_group_node": "//div[@class='module-play-list']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.dmxq.fun{id}", "playlist_info": "//div[contains(@class, 'module-info-introduction-content')]//p", "search_flag": true, "search_url_first_page": "https://www.dmxq.fun/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "https://www.dmxq.fun/vodsearch/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='module-items module-card-items']//div[@class='module-card-item module-item']", "search_vod_title": "//div[@class='module-card-item-title']/a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']/a/@href", "search_vod_link_url": "https://www.dmxq.fun{id}"};
-function ip20(e){
-const core=createIPlayrSpider(RULE_20,{key:"ip_dmxq"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_21 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "飞快", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://feikuai.tv/vodshow/1-----------.html", "url1": "https://feikuai.tv/vodshow/1--------{pg}---.html"}, {"title": "电视", "url0": "https://feikuai.tv/vodshow/2-----------.html", "url1": "https://feikuai.tv/vodshow/2--------{pg}---.html"}, {"title": "综艺", "url0": "https://feikuai.tv/vodshow/3-----------.html", "url1": "https://feikuai.tv/vodshow/3--------{pg}---.html"}, {"title": "动漫", "url0": "https://feikuai.tv/vodshow/4-----------.html", "url1": "https://feikuai.tv/vodshow/4--------{pg}---.html"}], "vod_node": "//div[contains(@class, 'module-items')]//a", "vod_info": "//div[@class='module-item-note']", "vod_score": "//div[@class='module-item-douban']", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://feikuai.tv{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[contains(@class, 'module-play-list')]", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://feikuai.tv{id}", "playlist_info": "//div[contains(@class, 'module-info-introduction-content')]", "search_flag": true, "search_url_first_page": "https://feikuai.tv/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "https://feikuai.tv/vodsearch/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='module-card-item module-item']", "search_vod_title": "//div[contains(@class, 'module-card-item-title')]/a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[contains(@class, 'module-card-item-title')]/a/@href", "search_vod_link_url": "https://feikuai.tv{id}"};
-function ip21(e){
-const core=createIPlayrSpider(RULE_21,{key:"ip_feikuai"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_22 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "飞快", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://feikuai.tv/vodshow/1--time---------.html", "url1": "https://feikuai.tv/vodshow/1--time------{pg}---.html"}, {"title": "剧集", "url0": "https://feikuai.tv/vodshow/2--time---------.html", "url1": "https://feikuai.tv/vodshow/2--time------{pg}---.html"}, {"title": "综艺", "url0": "https://feikuai.tv/vodshow/3--time---------.html", "url1": "https://feikuai.tv/vodshow/3--time------{pg}---.html"}, {"title": "动漫", "url0": "https://feikuai.tv/vodshow/4--time---------.html", "url1": "https://feikuai.tv/vodshow/4--time------{pg}---.html"}], "vod_node": "//div[contains(@class, 'module-items')]//a", "vod_info": "//div[@class='jidi']/span", "vod_score": "//div[@class='rating']", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "https://feikuai.tv{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://feikuai.tv{id}", "play_regex": "", "play_url": "", "playlist_flag": true, "playlist_group_node": "//div[@class='module-play-list']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://feikuai.tv{id}", "playlist_info": "//div[@class='module-info-introduction-content']//p", "search_flag": true, "search_url_first_page": "https://feikuai.tv/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "https://feikuai.tv/vodsearch/{wd}----------{pg}---.html", "search_vod_node": "//div[contains(@class, 'module-items')]//div[contains(@class, 'module-card-item')]", "search_vod_title": "//div[@class='module-card-item-title']//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "https://feikuai.tv{id}", "search_vod_link_id": "//div[@class='module-card-item-title']//a/@href", "search_vod_link_url": "https://feikuai.tv{id}"};
-function ip22(e){
-const core=createIPlayrSpider(RULE_22,{key:"ip_feikuai2"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_23 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "freeok", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.freeokk.pro/show/1-----------.html", "url1": "https://www.freeokk.pro/show/1--------{pg}---.html"}, {"title": "剧集", "url0": "https://www.freeokk.pro/show/2-----------.html", "url1": "https://www.freeokk.pro/show/2--------{pg}---.html"}, {"title": "综艺", "url0": "https://www.freeokk.pro/show/3-----------.html", "url1": "https://www.freeokk.pro/show/3--------{pg}---.html"}, {"title": "动漫", "url0": "https://www.freeokk.pro/show/4-----------.html", "url1": "https://www.freeokk.pro/show/4--------{pg}---.html"}], "vod_node": "//div[contains(@class, 'module-items')]/a", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.freeokk.pro{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[contains(@class, 'module-play-list')]", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.freeokk.pro{id}", "playlist_info": "//div[@class='module-info-introduction-content']", "search_flag": true, "search_url_first_page": "https://www.freeokk.pro/search/-------------.html?wd={wd}", "search_url_other_page": "https://www.freeokk.pro/search/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='module-card-item module-item']", "search_vod_title": "//div[@class='module-card-item-title']//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']//a/@href", "search_vod_link_url": "https://www.freeokk.pro{id}"};
-function ip23(e){
-const core=createIPlayrSpider(RULE_23,{key:"ip_freeok"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_24 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "福利姬", "episode_flag": false, "landscape_flag": true, "category": [{"title": "最新", "url0": "https://fuliji.cfd/", "url1": "https://fuliji.cfd/?page={pg}/"}], "vod_node": "//div[@id='main']/div/div", "vod_info": "//time", "vod_score": "", "vod_title": "//img/@alt", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "dXJsOiAiKGh0dHBbXiJdK20zdTgp", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://fuliji.cfd/search?q={wd}", "search_url_other_page": "https://fuliji.cfd/search?q={wd}&page={pg}", "search_vod_node": "//div[@id='main']/div/div", "search_vod_title": "//img/@alt", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "{id}"};
-function ip24(e){
-const core=createIPlayrSpider(RULE_24,{key:"ip_fuliji"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_25 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "gaze", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://gazes.top/filter", "url1": ""}], "vod_node": "//div[@id='mains']//article", "vod_info": "", "vod_score": "", "vod_title": "//h3", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://gazes.top{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "//ul[contains(@class, 'myui-content__list')]", "playlist_title": "//li//a", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://gazes.top/{id}", "playlist_info": "//p[@class='data hidden-xs']", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip25(e){
-const core=createIPlayrSpider(RULE_25,{key:"ip_gaze"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_26 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "getav", "episode_flag": false, "landscape_flag": true, "referer": "", "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", "open_with_safari_flag": true, "cf_flag": true, "category": [{"title": "最近更新", "url0": "https://getav.net/zh/latest", "url1": "https://getav.net/zh/latest?page={pg}"}], "vod_node": "//div[@class='site-catalog-grid']/div", "vod_info": "", "vod_score": "", "vod_title": "//h3", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://getav.net{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://getav.net/zh/search?q={wd}", "search_url_other_page": "https://getav.net/zh/search?q={wd}&page={pg}&limit=40&locale=zh", "search_vod_node": "//div[@class='group']", "search_vod_title": "//h3", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "https://getav.net{id}"};
-function ip26(e){
-const core=createIPlayrSpider(RULE_26,{key:"ip_getav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_27 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "girigiri愛動漫", "episode_flag": true, "landscape_flag": false, "referer": "https://bgm.girigirilove.com/", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "日番", "url0": "https://bgm.girigirilove.com/show/2-----------/", "url1": "https://bgm.girigirilove.com/show/2--------{pg}---/"}, {"title": "美番", "url0": "https://bgm.girigirilove.com/show/3-----------/", "url1": "https://bgm.girigirilove.com/show/3--------{pg}---/"}, {"title": "剧场版", "url0": "https://bgm.girigirilove.com/show/21-----------/", "url1": "https://bgm.girigirilove.com/show/21--------{pg}---/"}, {"title": "真人番剧", "url0": "https://bgm.girigirilove.com/show/20-----------/", "url1": "https://bgm.girigirilove.com/show/20--------{pg}---/"}], "vod_node": "//div[contains(@class, 'public-list-box')]", "vod_info": "", "vod_score": "//span[@class='public-prt hide ol3']", "vod_title": "//div[@class='public-list-button']//a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "https://anime.girigirilove.com{id}", "vod_link_id": "//div[@class='public-list-button']//a/@href", "vod_link_url": "https://bgm.girigirilove.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'anthology-list-play')]", "playlist_title": "//li//a", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://bgm.girigirilove.com{id}", "playlist_info": "//div[contains(@id, 'height_limit')]", "search_flag": true, "search_url_first_page": "https://bgm.girigirilove.com/search/-------------/?wd={wd}", "search_url_other_page": "https://bgm.girigirilove.com/search/{wd}----------{pg}---/", "search_vod_node": "//div[contains(@class, 'public-list-box')]", "search_vod_title": "//div[contains(@class, 'thumb-txt')]", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "https://bgm.girigirilove.com{id}", "search_vod_link_id": "//a[@class='public-list-exp']/@href", "search_vod_link_url": "https://bgm.girigirilove.com{id}"};
-function ip27(e){
-const core=createIPlayrSpider(RULE_27,{key:"ip_girigiri"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_28 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "hayav", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://hayav.com/category/video/", "url1": "https://hayav.com/category/video/page/{pg}/"}], "vod_node": "//main[@id='main-content']//article", "vod_info": "//time", "vod_score": "//div[@class='categories-wrap']", "vod_title": "//h3/a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://hayav.com/search/{wd}", "search_url_other_page": "https://hayav.com/search/{wd}/page/{pg}/", "search_vod_node": "//main[@id='main-content']//article", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "{id}"};
-function ip28(e){
-const core=createIPlayrSpider(RULE_28,{key:"ip_hayav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_29 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "info": "已失效，网页无法打开", "title": "韩剧看看", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": false, "category": [{"title": "剧集", "url0": "http://www.hanjukankan.com/xvs1xatxbtxctxdtxetxftxgtxhtatbtct.html", "url1": "http://www.hanjukankan.com/xvs1xatxbtxctxdtxetxftxgtxht{pg}atbtct.html"}, {"title": "电影", "url0": "http://www.hanjukankan.com/xvs2xatxbtxctxdtxetxftxgtxhtatbtct.html", "url1": "http://www.hanjukankan.com/xvs2xatxbtxctxdtxetxftxgtxht{pg}atbtct.html"}, {"title": "综艺", "url0": "http://www.hanjukankan.com/xvs3xatxbtxctxdtxetxftxgtxhtatbtct.html", "url1": "http://www.hanjukankan.com/xvs3xatxbtxctxdtxetxftxgtxht{pg}atbtct.html"}], "vod_node": "//div[contains(@class, 'module-items')]/a", "vod_info": "//div[contains(@class, 'module-item-note')]", "vod_score": "", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "http://www.hanjukankan.com{id}", "play_regex": "InVybCI6IihodHRwW14iXSsp", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[contains(@class, 'module-play-list-content')]", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "http://www.hanjukankan.com{id}", "playlist_info": "//div[contains(@class, 'module-info-introduction-content')]", "search_flag": true, "search_url_first_page": "http://www.hanjukankan.com/xvseabcdefghigklm.html?wd={wd}", "search_url_other_page": "http://www.hanjukankan.com/xvse{wd}abcdefghig{pg}klm.html", "search_vod_node": "//div[contains(@class, 'module-items')]//div[contains(@class, 'module-item')]", "search_vod_title": "//div[@class='module-card-item-title']/a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']/a/@href", "search_vod_link_url": "http://www.hanjukankan.comid}"};
-function ip29(e){
-const core=createIPlayrSpider(RULE_29,{key:"ip_hjkk"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_30 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "hohoj", "episode_flag": false, "landscape_flag": true, "referer": "", "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://hohoj.tv/search?type=all&order=latest&p=1", "url1": "https://hohoj.tv/search?type=all&order=latest&p={pg}"}], "vod_node": "//div[contains(@class, 'video-list')]//div[contains(@class, 'video-item')]", "vod_info": "", "vod_score": "", "vod_title": "//div[contains(@class, 'video-item-title')]", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://hohoj.tv{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://hohoj.tv/search?text={wd}", "search_url_other_page": "https://hohoj.tv/search?text={wd}&p={pg}", "search_vod_node": "//div[contains(@class, 'video-list')]//div[contains(@class, 'video-item')]", "search_vod_title": "//div[contains(@class, 'video-item-title')]", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://hohoj.tv{id}"};
-function ip30(e){
-const core=createIPlayrSpider(RULE_30,{key:"ip_hohoj"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_31 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "hsex", "episode_flag": false, "landscape_flag": true, "category": [{"title": "最新", "url0": "https://hsex.men/list-1.htm", "url1": "https://hsex.men/list-{pg}.htm"}], "vod_node": "//div[contains(@class, 'body')]//div[contains(@class, 'thumbnail')]", "vod_info": "//var[@class='duration']", "vod_score": "", "vod_title": "//h5/a", "vod_image_id": "", "vod_image_regex": "dXJsXCgnKFteJ10rKQ==", "vod_image_url": "{id}", "vod_link_id": "//h5/a/@href", "vod_link_url": "https://hsex.men/{id}", "play_regex": "dmlkZW8tc291cmNlIiBzcmM9IihodHRwW14iXSttM3U4KQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://hsex.men/search.htm?search={wd}", "search_url_other_page": "https://hsex.men/search-{pg}.htm?search={wd}", "search_vod_node": "//div[contains(@class, 'body')]//div[contains(@class, 'thumbnail')]", "search_vod_title": "//h5/a", "search_vod_image_id": "", "search_vod_image_regex": "dXJsXCgnKFteJ10rKQ==", "search_vod_image_url": "{id}", "search_vod_link_id": "//h5/a/@href", "search_vod_link_url": "https://hsex.men/{id}"};
-function ip31(e){
-const core=createIPlayrSpider(RULE_31,{key:"ip_hsex"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_32 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "hstream", "episode_flag": false, "landscape_flag": true, "referer": "", "cf_flag": true, "user_agent": "", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://hstream.moe/search?order=recently-uploaded", "url1": "https://hstream.moe/search?order=recently-uploaded&page={pg}"}], "vod_node": "//div[@class='flex justify-center']/div/div", "vod_info": "", "vod_score": "", "vod_title": "//img/@alt", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "https://hstream.moe{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://hstream.moe/search?search={wd}", "search_url_other_page": "https://hstream.moe/search?search={wd}&page={pg}", "search_vod_node": "//div[@class='flex justify-center']/div/div", "search_vod_title": "//img/@alt", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "https://hstream.moe{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "b{id}"};
-function ip32(e){
-const core=createIPlayrSpider(RULE_32,{key:"ip_hstream"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_33 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "huangguo", "episode_flag": false, "landscape_flag": false, "referer": "https://huangguoai.com/", "cf_flag": true, "imgkey": "f5d965df75336270", "imgiv": "97b60394abc2fbe1", "imgmethod": "AES-128-CBC", "open_with_safari_flag": true, "category": [{"title": "短剧", "url0": "https://huangguoai.com/ai-duanju/", "url1": "https://huangguoai.com/ai-duanju/{pg}/"}, {"title": "漫剧", "url0": "https://huangguoai.com/ai-manju/", "url1": "https://huangguoai.com/ai-manju/{pg}/"}, {"title": "换脸", "url0": "https://huangguoai.com/ai-huanlian/", "url1": "https://huangguoai.com/ai-huanlian/{pg}/"}, {"title": "魔改", "url0": "https://huangguoai.com/ai-mogai/", "url1": "https://huangguoai.com/ai-mogai/{pg}/"}], "vod_node": "//main//div[contains(@class, 'hg-card-grid is-active')]//div[@class='hg-drama-card']", "vod_info": "//span[@class='hg-drama-card__episode']", "vod_score": "//span[@class='hg-drama-card__score']", "vod_title": "//h3/a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "https://huangguoai.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='hg-play__episodes']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://huangguoai.com{id}", "playlist_info": "//p[@class='hg-play__panel-desc']", "search_flag": true, "search_url_first_page": "https://huangguoai.com/search/video/{wd}", "search_url_other_page": "https://huangguoai.com/search/video/{wd}/{pg}/", "search_vod_node": "//div[@class='hg-card-grid']//div[@class='hg-drama-card']", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "https://huangguoai.com{id}"};
-function ip33(e){
-const core=createIPlayrSpider(RULE_33,{key:"ip_huangguo"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_34 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "iwant-sex", "episode_flag": false, "landscape_flag": true, "referer": "https://iwant-sex.com/", "category": [{"title": "最近", "url0": "https://iwant-sex.com/videos/?sortby=newest", "url1": "https://iwant-sex.com/videos/?sortby=newest&page={pg}/"}, {"title": "热门", "url0": "https://iwant-sex.com/videos/?sortby=hottest", "url1": "https://iwant-sex.com/videos/?sortby=hottest&page={pg}/"}, {"title": "推荐", "url0": "https://iwant-sex.com/videos/?sortby=promoted", "url1": "https://iwant-sex.com/videos/?sortby=promoted&page={pg}/"}, {"title": "最赞", "url0": "https://iwant-sex.com/videos/?sortby=mostlike", "url1": "https://iwant-sex.com/videos/?sortby=mostlike&page={pg}/"}], "vod_node": "//div[contains(@class, 'container')]//div[contains(@class, 'related_videos_templates')]", "vod_info": "//div[@class='duration']", "vod_score": "//div[@class='video-added']", "vod_title": "//span[contains(@class, 'video-title')]", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "https://iwant-sex.com{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://iwant-sex.com{id}", "play_regex": "Y29udGVudFVybCI6ICIoW14iXSsp", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://iwant-sex.com/search/?search_query={wd}", "search_url_other_page": "https://iwant-sex.com/search/?search_query={wd}&page={pg}", "search_vod_node": "//div[contains(@class, 'container')]//div[contains(@class, 'related_videos_templates')]", "search_vod_title": "//span[contains(@class, 'video-title')]", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "https://iwant-sex.com{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://iwant-sex.com{id}"};
-function ip34(e){
-const core=createIPlayrSpider(RULE_34,{key:"ip_iwant"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_35 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javday", "episode_flag": false, "landscape_flag": true, "cf_flag": true, "referer": "https://javday.app/", "category": [{"title": "新作上市", "url0": "https://javday.app/category/new-release/", "url1": "https://javday.app/category/new-release/page/{pg}/"}, {"title": "有码", "url0": "https://javday.app/category/censored/", "url1": "https://javday.app/category/censored/page/{pg}/"}, {"title": "无码", "url0": "https://javday.app/category/uncensored-leaked/", "url1": "https://javday.app/category/uncensored-leaked/page/{pg}/"}, {"title": "AI短剧", "url0": "https://javday.app/category/aiav/", "url1": "https://javday.app/category/aiav/page/{pg}/"}], "vod_node": "//div[contains(@class, 'video-wrapper')]//div[contains(@class, 'col-style')]", "vod_info": "", "vod_score": "", "vod_title": "//span[@class='title']", "vod_image_id": "", "vod_image_regex": "YmFja2dyb3VuZC1pbWFnZTogdXJsXCgoW15cKV0rKQ==", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://javday.app{id}", "play_regex": "dXJsOiAnKGh0dHBzW14nXSsp", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javday.app/search/?wd={wd}", "search_url_other_page": "https://javday.app/search/page/{pg}/wd/{wd}/", "search_vod_node": "//div[contains(@class, 'video-wrapper')]//div[contains(@class, 'col-style')]", "search_vod_title": "//span[@class='title']", "search_vod_image_id": "", "search_vod_image_regex": "YmFja2dyb3VuZC1pbWFnZTogdXJsXCgoW15cKV0rKQ==", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://javday.app{id}"};
-function ip35(e){
-const core=createIPlayrSpider(RULE_35,{key:"ip_javday"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_36 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javdoe", "episode_flag": false, "landscape_flag": false, "referer": "https://turbovid.xyz/", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://javdoe.sh/recent/", "url1": "https://javdoe.sh/recent/{pg}/"}], "vod_node": "//ul[contains(@class, 'videos')]//li", "vod_info": "", "vod_score": "", "vod_title": "//span[contains(@class, 'video-title')]", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a[contains(@class, 'thumbnail')]/@href", "vod_link_url": "https://javdoe.sh{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javdoe.sh/search/video/?s={wd}", "search_url_other_page": "https://javdoe.sh/search/video/?s={wd}&page={pg}", "search_vod_node": "//ul[contains(@class, 'videos')]//li", "search_vod_title": "//span[contains(@class, 'video-title')]", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a[contains(@class, 'thumbnail')]/@href", "search_vod_link_url": "https://javdoe.sh{id}"};
-function ip36(e){
-const core=createIPlayrSpider(RULE_36,{key:"ip_javdoe"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_37 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javgg", "episode_flag": false, "landscape_flag": false, "referer": "https://javggvideo.xyz/", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://javgg.net/new-post/", "url1": "https://javgg.net/new-post/page/{pg}/"}], "vod_node": "//article", "vod_info": "", "vod_score": "//div[@class='data']/span", "vod_title": "//h3/a", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javgg.net/?s={wd}", "search_url_other_page": "https://javgg.net/page/{pg}/?s={wd}", "search_vod_node": "//div[@class='result-item']", "search_vod_title": "//div[@class='contenido']/p", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "{id}"};
-function ip37(e){
-const core=createIPlayrSpider(RULE_37,{key:"ip_javgg"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_38 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javhd", "episode_flag": false, "landscape_flag": false, "cf_flag": true, "referer": "https://emturbovid.com/", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://javhd.today/recent/", "url1": "https://javhd.today/recent/{pg}"}], "vod_node": "//ul[@class='videos']//li", "vod_info": "//span[@class='badgetime']//span[@class='left']", "vod_score": "//span[contains(@class, 'video-overlay')]", "vod_title": "//span[@class='video-title']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://javhd.today{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javhd.today/search/video/?s={wd}", "search_url_other_page": "https://javhd.today/search/video/?s={wd}&page={pg}", "search_vod_node": "//ul[@class='videos']//li", "search_vod_title": "//span[@class='video-title']", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://javhd.today{id}"};
-function ip38(e){
-const core=createIPlayrSpider(RULE_38,{key:"ip_javhd"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_39 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javhdz.hot", "episode_flag": false, "landscape_flag": true, "referer": "https://asnwish.com/", "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0", "open_with_safari_flag": true, "category": [{"title": "trending", "url0": "https://javhdz.hot/trending/", "url1": "https://javhdz.hot/trending/page/{pg}/"}, {"title": "censored", "url0": "https://javhdz.hot/category/censored-2/", "url1": "https://javhdz.hot/category/censored-2/page/{pg}/"}, {"title": "uncensored", "url0": "https://javhdz.hot/category/uncensored-3/", "url1": "https://javhdz.hot/category/uncensored-3/page/{pg}/"}, {"title": "beauty", "url0": "https://javhdz.hot/category/beauty-4/", "url1": "https://javhdz.hot/category/beauty-4/page/{pg}/"}], "vod_node": "//ul[@id='movie-last-movie']//li", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='movie-title-1']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "https://javhdz.hot{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://javhdz.hot{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javhdz.hot/search/{wd}/", "search_url_other_page": "https://javhdz.hot/search/{wd}/page/{pg}/", "search_vod_node": "//ul[@id='movie-last-movie']", "search_vod_title": "//li//div[@class='movie-title-1']", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "https://javhdz.hot{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://javhdz.hot{id}"};
-function ip39(e){
-const core=createIPlayrSpider(RULE_39,{key:"ip_javhdz"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_40 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javmix", "episode_flag": false, "landscape_flag": true, "referer": "https://iplayerhls.com/", "open_with_safari_flag": true, "category": [{"title": "エロ动画", "url0": "https://javmix.tv/video/", "url1": "https://javmix.tv/video/page/{pg}/"}, {"title": "去马赛克", "url0": "https://javmix.tv/xvideo/", "url1": "https://javmix.tv/xvideo/page/{pg}/"}, {"title": "业余岗位", "url0": "https://javmix.tv/fc2ppv/", "url1": "https://javmix.tv/fc2ppv/page/{pg}/"}, {"title": "急升", "url0": "https://javmix.tv/soaring/", "url1": "https://javmix.tv/soaring/page/{pg}/"}, {"title": "人气度", "url0": "https://javmix.tv/popularity/", "url1": "https://javmix.tv/popularity/page/{pg}/"}], "vod_node": "//div[@class='post-list']//a", "vod_info": "//div[@class='post-list-time']", "vod_score": "//div[@class='post-list-duration']", "vod_title": "//span", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javmix.tv/?s={wd}", "search_url_other_page": "https://javmix.tv/page/{pg}/?s={wd}", "search_vod_node": "//div[@class='post-list']//a", "search_vod_title": "//span", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "{id}"};
-function ip40(e){
-const core=createIPlayrSpider(RULE_40,{key:"ip_javmix"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_41 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javopen", "episode_flag": false, "landscape_flag": true, "referer": "https://emturbovid.com/", "open_with_safari_flag": true, "category": [{"title": "censored", "url0": "https://javopen.co/jav-censored/", "url1": "https://javopen.co/jav-censored/page/{pg}/"}, {"title": "uncensored", "url0": "https://javopen.co/jav-uncensored/", "url1": "https://javopen.co/jav-uncensored/page/{pg}/"}, {"title": "mgstage", "url0": "https://javopen.co/mgstage/", "url1": "https://javopen.co/mgstage/page/{pg}/"}, {"title": "amatuer-porn", "url0": "https://javopen.co/amatuer-porn/", "url1": "https://javopen.co/amatuer-porn/page/{pg}/"}], "vod_node": "//div[contains(@class, 'video-section')]//div[contains(@class, 'col-md-3')]", "vod_info": "//span[@class='date']", "vod_score": "", "vod_title": "//h3/a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javopen.co/?s={wd}", "search_url_other_page": "https://javopen.co/page/{pg}/?s={wd}", "search_vod_node": "//div[@class='container']//div[contains(@class, 'main-content')]//div[contains(@class, 'col-md-3')]", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "{id}"};
-function ip41(e){
-const core=createIPlayrSpider(RULE_41,{key:"ip_javopen"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_42 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "jav.sb", "episode_flag": false, "landscape_flag": true, "referer": "https://jav.sb/", "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15", "open_with_safari_flag": true, "cf_flag": true, "category": [{"title": "最近更新", "url0": "https://javsb.com/cn/javtype/new", "url1": "https://javsb.com/cn/javtype/new?page=pg"}], "vod_node": "//div[contains(@class, 'thumbnail')]", "vod_info": "", "vod_score": "//span[contains(@class, 'absolute')]", "vod_title": "//img/@alt", "vod_image_id": "//video/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://javsb.com{id}", "play_regex": "InVybCI6IihbXiJdK20zdTgp", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javsb.com/cn/search/{wd}", "search_url_other_page": "https://javsb.com/cn/search/{wd}?page={pg}", "search_vod_node": "//div[contains(@class, 'thumbnail')]", "search_vod_title": "//img/@alt", "search_vod_image_id": "//video/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://javsb.com{id}"};
-function ip42(e){
-const core=createIPlayrSpider(RULE_42,{key:"ip_javsb"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_43 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javseen", "episode_flag": false, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "recent", "url0": "https://javseen.tv/recent/", "url1": "https://javseen.tv/recent/{pg}/"}], "vod_node": "//ul[@class='videos']//li", "vod_info": "//span[contains(@class, 'video-overlay badge')]", "vod_score": "", "vod_title": "//span[@class='video-title']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://javseen.tv{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javseen.tv/search/video/?s={wd}", "search_url_other_page": "https://javseen.tv/search/video/?s={wd}&page={pg}", "search_vod_node": "//ul[@class='videos']//li", "search_vod_title": "//span[@class='video-title']", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://javseen.tv{id}"};
-function ip43(e){
-const core=createIPlayrSpider(RULE_43,{key:"ip_javseen"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_44 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "javtsunami", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://javtsunami.com/?filter=latest", "url1": "https://javtsunami.com/page/{pg}?filter=latest"}], "vod_node": "//main[@id='main']//article", "vod_info": "", "vod_score": "//span[@class='duration']", "vod_title": "//header/span", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://javtsunami.com/?s={wd}", "search_url_other_page": "https://javtsunami.com/page/{pg}?s={wd}", "search_vod_node": "//main[@id='main']//article", "search_vod_title": "//header/span", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "{id}"};
-function ip44(e){
-const core=createIPlayrSpider(RULE_44,{key:"ip_javtsunami"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_45 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "jddzx", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://jddzx.cc/vodshow/id/dianying.html", "url1": "https://jddzx.cc/vodshow/id/dianying/page/{pg}.html"}, {"title": "剧集", "url0": "https://jddzx.cc/vodshow/id/juji.html", "url1": "https://jddzx.cc/vodshow/id/juji/page/{pg}.html"}, {"title": "综艺", "url0": "https://jddzx.cc/vodshow/id/zongyi.html", "url1": "https://jddzx.cc/vodshow/id/zongyi/page/{pg}.html"}, {"title": "动漫", "url0": "https://jddzx.cc/vodshow/id/dongman.html", "url1": "https://jddzx.cc/vodshow/id/dongman/page/{pg}.html"}], "vod_node": "//div[contains(@class, 'module-items')]/a", "vod_info": "//div[@class='module-item-note']", "vod_score": "", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://jddzx.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='module-play-list']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://jddzx.cc{id}", "playlist_info": "//div[@class='module-info-introduction-content']", "search_flag": true, "search_url_first_page": "https://jddzx.cc/vodsearch.html?wd={wd}", "search_url_other_page": "https://jddzx.cc/vodsearch{wd}/page/{pg}.html", "search_vod_node": "//div[@class='module-items module-card-items']//div[@class='module-card-item-class']", "search_vod_title": "//div[@class='module-card-item-title']//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='module-card-item-title']//a/@href", "search_vod_link_url": "https://jddzx.cc{id}"};
-function ip45(e){
-const core=createIPlayrSpider(RULE_45,{key:"ip_jddzx"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_46 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "kanav", "episode_flag": false, "landscape_flag": true, "referer": "https://kanav.ad/", "open_with_safari_flag": true, "category": [{"title": "中文字幕", "url0": "https://kanav.info/index.php/vod/type/id/1.html", "url1": "https://kanav.info/index.php/vod/type/id/1/page/{pg}.html"}, {"title": "日韩有码", "url0": "https://kanav.info/index.php/vod/type/id/2.html", "url1": "https://kanav.info/index.php/vod/type/id/2/page/{pg}.html"}, {"title": "日韩无码", "url0": "https://kanav.info/index.php/vod/type/id/3.html", "url1": "https://kanav.info/index.php/vod/type/id/3/page/{pg}.html"}, {"title": "国产AV", "url0": "https://kanav.info/index.php/vod/type/id/4.html", "url1": "https://kanav.info/index.php/vod/type/id/4/page/{pg}.html"}], "vod_node": "//div[@class='post-list']//div[contains(@class, 'col-md-3')]", "vod_info": "//span[@class='model-view']", "vod_score": "//span[@class='model-view-left']", "vod_title": "//div[contains(@class, 'entry-title')]/a", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[contains(@class, 'entry-title')]/a/@href", "vod_link_url": "https://kanav.info{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://kanav.info/index.php/vod/search.html?wd={wd}&by=time_add", "search_url_other_page": "https://kanav.info/index.php/vod/search/by/time_add/page/{pg}/wd/{wd}.html", "search_vod_node": "//div[@class='post-list']//div[contains(@class, 'video-item')]", "search_vod_title": "//div[contains(@class, 'entry-title')]/a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[contains(@class, 'entry-title')]/a/@href", "search_vod_link_url": "https://kanav.info{id}"};
-function ip46(e){
-const core=createIPlayrSpider(RULE_46,{key:"ip_kanav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_47 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "美剧星球", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "美剧", "url0": "https://www.fmeiju.com/list/meiju.html", "url1": "https://www.fmeiju.com/list/meiju-{pg}.html"}, {"title": "电视剧", "url0": "https://www.fmeiju.com/vodshow/tv-----------.html", "url1": "https://www.fmeiju.com/vodshow/tv--------{pg}---.html"}, {"title": "综艺", "url0": "https://www.fmeiju.com/list/zy.html", "url1": "https://www.fmeiju.com/list/zy-{pg}.html"}, {"title": "动漫", "url0": "https://www.fmeiju.com/list/dm.html", "url1": "https://www.fmeiju.com/list/dm-{pg}.html"}], "vod_node": "//ul[contains(@class, 'img-list')]//li", "vod_info": "", "vod_score": "", "vod_title": "//span[@class='vname']", "vod_image_id": "//a[contains(@class, 'img-pic')]/@data-original", "vod_image_regex": "", "vod_image_url": "https://www.fmeiju.com{id}", "vod_link_id": "//a[contains(@class, 'img-pic')]/@href", "vod_link_url": "https://www.fmeiju.com{id}", "play_regex": "", "play_url": "", "playlist_flag": true, "playlist_group_node": "//div[@class='paly_list_btn']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "{id}", "playlist_info": "//div[@class='yp_context']", "search_flag": true, "search_url_first_page": "https://www.fmeiju.com/?s={wd}", "search_url_other_page": "https://www.fmeiju.com/page/{pg}?s={wd}", "search_vod_node": "//ul[contains(@class, 'img-list')]//li", "search_vod_title": "//span[@class='vname']", "search_vod_image_id": "", "search_vod_image_regex": "//a[contains(@class, 'img-pic')]/@href", "search_vod_image_url": "https://www.fmeiju.com{id}", "search_vod_link_id": "//a[contains(@class, 'img-pic')]/@href", "search_vod_link_url": "https://www.fmeiju.com{id}"};
-function ip47(e){
-const core=createIPlayrSpider(RULE_47,{key:"ip_kmeiju"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_48 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "libvio", "episode_flag": true, "landscape_flag": false, "referer": "https://www.libvio.cc/", "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.libvio.lat/type/1.html", "url1": "https://www.libvio.lat/type/1-{pg}.html"}, {"title": "剧集", "url0": "https://www.libvio.lat/type/2.html", "url1": "https://www.libvio.lat/type/2-{pg}.html"}, {"title": "日韩剧", "url0": "https://www.libvio.lat/type/15.html", "url1": "https://www.libvio.lat/type/15-{pg}.html"}, {"title": "欧美剧", "url0": "https://www.libvio.lat/type/16.html", "url1": "https://www.libvio.lat/type/16-{pg}.html"}, {"title": "动漫", "url0": "https://www.libvio.lat/type/4.html", "url1": "https://www.libvio.lat/type/4-{pg}.html"}], "vod_node": "//ul[contains(@class, 'stui-vodlist')]//li", "vod_info": "//span[contains(@class, 'pic-text')]", "vod_score": "//span[contains(@class, 'pic-tag')]", "vod_title": "//h4/a", "vod_image_id": "//a[contains(@class, 'stui-vodlist__thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h4/a/@href", "vod_link_url": "https://www.libvio.lat{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'stui-content__playlist')]", "playlist_title": "//li/a", "playlist_link_id": "//li/a/@href", "playlist_link_url": "https://www.libvio.lat{id}", "playlist_info": "//span[@class='detail-content']", "search_flag": true, "search_url_first_page": "https://www.libvio.lat/search/-------------.html?wd={wd}&submit=", "search_url_other_page": "https://www.libvio.lat/search/{wd}----------{pg}---.html", "search_vod_node": "//ul[contains(@class, 'stui-vodlist')]//li", "search_vod_title": "//h4/a", "search_vod_image_id": "//a[contains(@class, 'stui-vodlist__thumb')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4/a/@href", "search_vod_link_url": "https://www.libvio.lat{id}"};
-function ip48(e){
-const core=createIPlayrSpider(RULE_48,{key:"ip_libvio2"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_49 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "路漫漫", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://www.lmm85.com/label/new.html", "url1": "https://www.lmm85.com/label/new/page/{pg}.html"}, {"title": "动漫", "url0": "https://www.lmm85.com/type/dongman.html", "url1": "https://www.lmm85.com/type/dongman_{pg}.html"}, {"title": "电影", "url0": "https://www.lmm85.com/type/dianying.html", "url1": "https://www.lmm85.com/type/dianying_{pg}.html"}], "vod_node": "//div[@id='mdym']//div[contains(@class, 'video-img-box')]", "vod_info": "", "vod_score": "", "vod_title": "//h6//a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h6//a/@href", "vod_link_url": "https://www.lmm85.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='scroll-content']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.lmm85.com{id}", "playlist_info": "//div[@class='video-info-item video-info-content']", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip49(e){
-const core=createIPlayrSpider(RULE_49,{key:"ip_lmm"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_50 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "pornlulu", "episode_flag": false, "landscape_flag": true, "open_with_safari_flag": false, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1", "category": [{"title": "最新", "url0": "https://www.pornlulu.com/?sort=id", "url1": "https://www.pornlulu.com/?sort=id&page={pg}/"}], "vod_node": "//div[contains(@id, 'videos')]//div[@class='card']", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='two-lines']//a[@class='visited']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='two-lines']//a[@class='visited']/@href", "vod_link_regex": "", "vod_link_url": "https://www.pornlulu.com{id}", "play_regex": "c291cmNlIHNyYz0iKFteIl0rKQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_regex": "", "search_vod_link_url": ""};
-function ip50(e){
-const core=createIPlayrSpider(RULE_50,{key:"ip_lulu"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_51 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "lvv2", "episode_flag": false, "landscape_flag": true, "open_with_safari_flag": true, "category": [{"title": "最新", "url0": "https://bad.news/av", "url1": "https://bad.news/av/page-{pg}/"}], "vod_node": "//div[contains(@class, 'content')]//div[contains(@class, 'link')]", "vod_info": "//div[contains(@class, 'ct-time')]/span", "vod_score": "", "vod_title": "//h3/a", "vod_image_id": "//img/@data-echo", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "https://bad.news{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip51(e){
-const core=createIPlayrSpider(RULE_51,{key:"ip_lvv2"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_52 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "麻豆社", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "新作上市", "url0": "https://madou.club/page/1", "url1": "https://madou.club/page/{pg}/"}], "vod_node": "//article", "vod_info": "", "vod_score": "", "vod_title": "//h2//a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h2//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://madou.club/?s={wd}", "search_url_other_page": "https://madou.club/page/{pg}?s={wd}", "search_vod_node": "//article", "search_vod_title": "//h2//a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h2//a/@href", "search_vod_link_url": "{id}"};
-function ip52(e){
-const core=createIPlayrSpider(RULE_52,{key:"ip_madouclub"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_53 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "美剧窝", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.meijuwo.cc/type/dianying/", "url1": "https://www.meijuwo.cc/type/dianying-{pg}/"}, {"title": "剧集", "url0": "https://www.meijuwo.cc/type/meiju/", "url1": "https://www.meijuwo.cc/type/meiju-{pg}/"}], "vod_node": "//ul[@class='myui-vodlist clearfix']//li", "vod_info": "", "vod_score": "", "vod_title": "//h4//a", "vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h4//a/@href", "vod_link_url": "https://www.meijuwo.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'myui-content__list')]", "playlist_title": "//li//a", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://www.meijuwo.cc{id}", "playlist_info": "//span[@class='data']", "search_flag": true, "search_url_first_page": "https://www.meijuwo.cc/search/--/?wd={wd}&submit=", "search_url_other_page": "https://www.meijuwo.cc/search/{wd}--/page/{pg}/", "search_vod_node": "//ul[@class='myui-vodlist__media clearfix']//li", "search_vod_title": "//h4//a", "search_vod_image_id": "//div[@class='thumb']//a/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4//a/@href", "search_vod_link_url": "https://www.meijuwo.cc{id}"};
-function ip53(e){
-const core=createIPlayrSpider(RULE_53,{key:"ip_meijuwo"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_54 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "memojav", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://memojav.com/video/", "url1": "https://memojav.com/video/page-{pg}"}], "vod_node": "//article//div[contains(@id, 'relative-video')]/a", "vod_info": "", "vod_score": "", "vod_title": "//div[contains(@class, 'video-title')]", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://memojav.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip54(e){
-const core=createIPlayrSpider(RULE_54,{key:"ip_memojav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_55 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "missav", "episode_flag": false, "landscape_flag": true, "referer": "https://missav.ws", "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://missav.ws/dm515/new", "url1": "https://missav.ws/dm515/new?page={pg}"}, {"title": "新作上市", "url0": "https://missav.ws/dm590/release", "url1": "https://missav.ws/dm590/release?page={pg}"}, {"title": "中文字幕", "url0": "https://missav.ws/dm265/chinese-subtitle", "url1": "https://missav.ws/dm265/chinese-subtitle?page={pg}"}, {"title": "麻豆", "url0": "https://missav.ws/dm35/madou", "url1": "https://missav.ws/dm35/madou?page={pg}"}, {"title": "无码流出", "url0": "https://missav.ws/dm628/uncensored-leak", "url1": "https://missav.ws/dm628/uncensored-leak?page={pg}"}, {"title": "fc2", "url0": "https://missav.ws/dm150/fc2", "url1": "https://missav.ws/dm150/fc2?page={pg}"}, {"title": "luxu", "url0": "https://missav.ws/dm21/luxu", "url1": "https://missav.ws/dm21/luxu?page={pg}"}], "vod_node": "//div[@class='thumbnail group']", "vod_info": "", "vod_score": "//span[contains(@class, 'absolute')]", "vod_title": "//a[contains(@class, 'text-secondary')]", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a[contains(@class, 'text-secondary')]/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://missav.ws/search/{wd}", "search_url_other_page": "https://missav.ws/search/{wd}?page={pg}", "search_vod_node": "//div[@class='thumbnail group']", "search_vod_title": "//a[contains(@class, 'text-secondary')]", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a[contains(@class, 'text-secondary')]/@href", "search_vod_link_url": "{id}"};
-function ip55(e){
-const core=createIPlayrSpider(RULE_55,{key:"ip_missav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_56 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "missav123", "episode_flag": false, "landscape_flag": true, "referer": "", "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://missav123.com/dm515/new", "url1": "https://missav123.com/dm515/new?page={pg}"}, {"title": "新作上市", "url0": "https://missav123.com/dm590/release", "url1": "https://missav123.cmo/dm590/release?page={pg}"}, {"title": "中文字幕", "url0": "https://missav123.com/dm265/chinese-subtitle", "url1": "https://missav123.com/dm265/chinese-subtitle?page={pg}"}, {"title": "麻豆", "url0": "https://missav123.com/dm35/madou", "url1": "https://missav123.com/dm35/madou?page={pg}"}, {"title": "无码流出", "url0": "https://missav123.com/dm628/uncensored-leak", "url1": "https://missav123.com/dm628/uncensored-leak?page={pg}"}, {"title": "fc2", "url0": "https://missav123.com/dm150/fc2", "url1": "https://missav123.com/dm150/fc2?page={pg}"}, {"title": "luxu", "url0": "https://missav123.com/dm21/luxu", "url1": "https://missav123.com/dm21/luxu?page={pg}"}], "vod_node": "//div[@class='thumbnail group']", "vod_info": "", "vod_score": "//span[contains(@class, 'absolute')]", "vod_title": "//a[contains(@class, 'text-secondary')]", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a[contains(@class, 'text-secondary')]/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://missav123.com/search/{wd}", "search_url_other_page": "https://missav123.com/search/{wd}?page={pg}", "search_vod_node": "//div[@class='thumbnail group']", "search_vod_title": "//a[contains(@class, 'text-secondary')]", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a[contains(@class, 'text-secondary')]/@href", "search_vod_link_url": "{id}"};
-function ip56(e){
-const core=createIPlayrSpider(RULE_56,{key:"ip_missav123"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_57 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "monsnode.com", "episode_flag": false, "landscape_flag": true, "referer": "", "cf_flag": false, "user_agent": "", "category": [{"title": "最近更新", "url0": "https://monsnode.com/?page=1", "url1": "https://monsnode.com/?page={pg}"}], "vod_node": "//div[@id='scroll']//div[@class='listn']", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='user']//span", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "dmFyIHUgPSBhdG9iXCgnKFteJ10rKQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip57(e){
-const core=createIPlayrSpider(RULE_57,{key:"ip_monsnode"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_58 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "motv", "episode_flag": false, "landscape_flag": true, "referer": "https://motv.app/", "open_with_safari_flag": false, "category": [{"title": "日本有码", "url0": "https://motv.app/vodshow/20-----------/", "url1": "https://motv.app/vodshow/20--------{pg}---/"}, {"title": "日本无码", "url0": "https://motv.app/vodshow/50-----------/", "url1": "https://motv.app/vodshow/50--------{pg}---/"}, {"title": "国产", "url0": "https://motv.app/vodshow/41-----------/", "url1": "https://motv.app/vodshow/41--------{pg}---/"}], "vod_node": "//div[contains(@class, 'movie-list-body flex')]//div[contains(@class, 'movie-list-item')]", "vod_info": "", "vod_score": "", "vod_title": "//div[contains(@class, 'movie-title')]", "vod_image_id": "//div[contains(@class, 'movie-post-lazyload')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://motv.app{id}", "play_regex": "InVybCI6IihodHRwc1teIl0rKQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://motv.app/vodsearch/-------------/?wd={wd}", "search_url_other_page": "https://motv.app/vodsearch/{wd}----------{pg}---/", "search_vod_node": "//div[contains(@class, 'movie-list-body flex')]//div[contains(@class, 'vod-search-list')]", "search_vod_title": "//div[contains(@class, 'movie-title')]", "search_vod_image_id": "//div[contains(@class, 'movie-post-lazyload')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://motv.app{id}"};
-function ip58(e){
-const core=createIPlayrSpider(RULE_58,{key:"ip_motv"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_59 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "麦田", "episode_flag": true, "landscape_flag": false, "referer": "https://www.mtyy1.cc/", "cf_flag": true, "use-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.mtyy1.cc/vodshow/1--hits_week---------.html", "url1": "https://www.mtyy1.cc/vodshow/1--hits_week------{pg}---.html"}, {"title": "剧集", "url0": "https://www.mtyy1.cc/vodshow/2--hits_week---------.html", "url1": "https://www.mtyy1.cc/vodshow/2--hits_week------{pg}---.html"}, {"title": "综艺", "url0": "https://www.mtyy1.cc/vodshow/3--hits_week---------.html", "url1": "https://www.mtyy1.cc/vodshow/3--hits_week------{pg}---.html"}, {"title": "动漫", "url0": "https://www.mtyy1.cc/vodshow/4--hits_week---------.html", "url1": "https://www.mtyy1.cc/vodshow/4--hits_week------{pg}---.html"}], "vod_node": "//div[contains(@class, 'public-list-box')]", "vod_info": "//span[contains(@class, 'public-list-prb')]", "vod_score": "//span[contains(@class, 'public-prt')]", "vod_title": "//div[@class='public-list-button']//a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='public-list-button']//a/@href", "vod_link_url": "https://www.mtyy1.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'anthology-list-play')]", "playlist_title": "//li//a", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://www.mtyy1.cc{id}", "playlist_info": "//div[@class='this-desc']", "search_flag": true, "search_url_first_page": "https://www.mtyy1.cc/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "https://www.mtyy1.cc/vodsearch/{wd}----------{pg}---.html", "search_vod_node": "//div[contains(@class, 'public-list-box')]", "search_vod_title": "//div[@class='public-list-button']//a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//div[@class='public-list-button']//a/@href", "search_vod_link_url": "https://www.mtyy1.cc{id}"};
-function ip59(e){
-const core=createIPlayrSpider(RULE_59,{key:"ip_mt"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_60 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "Mustjav", "episode_flag": false, "landscape_flag": true, "category": [{"title": "无码", "url0": "https://mustjav.com/index.php/vod/type/id/23.html", "url1": "https://mustjav.com/index.php/vod/type/id/23/page/{pg}.html"}, {"title": "有码", "url0": "https://mustjav.com/index.php/vod/type/id/22.html", "url1": "https://mustjav.com/index.php/vod/type/id/22/page/{pg}.html"}, {"title": "自拍", "url0": "https://mustjav.com/index.php/vod/type/id/24.html", "url1": "https://mustjav.com/index.php/vod/type/id/24/page/{pg}.html"}, {"title": "动漫", "url0": "https://mustjav.com/index.php/vod/type/id/38.html", "url1": "https://mustjav.com/index.php/vod/type/id/38/page/{pg}.html"}, {"title": "欧美", "url0": "https://mustjav.com/index.php/vod/type/id/25.html", "url1": "https://mustjav.com/index.php/vod/type/id/25/page/{pg}.html"}], "vod_node": "//div[@class='colVideoList']", "vod_info": "//small[@class='layer']", "vod_score": "", "vod_title": "//a[contains(@class, 'title')]", "vod_image_id": "", "vod_image_regex": "YmFja2dyb3VuZC1pbWFnZTogdXJsXCgnKFteJ10rKQ==", "vod_image_url": "{id}", "vod_link_id": "//a[contains(@class, 'title')]/@href", "vod_link_url": "https://mustjav.com{id}", "play_regex": "InVybCI6IihodHRwW14iXSsp", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://mustjav.com/index.php/vod/search.html?wd={wd}", "search_url_other_page": "https://mustjav.com/index.php/vod/search/page/{pg}/wd/{wd}.html", "search_vod_node": "//div[@class='colVideoList']", "search_vod_title": "//a[contains(@class, 'title')]", "search_vod_image_id": "", "search_vod_image_regex": "YmFja2dyb3VuZC1pbWFnZTogdXJsXCgnKFteJ10rKQ==", "search_vod_image_url": "{id}", "search_vod_link_id": "//a[contains(@class, 'title')]/@href", "search_vod_link_url": "https://mustjav.com{id}"};
-function ip60(e){
-const core=createIPlayrSpider(RULE_60,{key:"ip_mustjav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_61 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "myflixer", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "movie", "url0": "https://simyflix.com/latest-movies/", "url1": "https://simyflix.com/latest-movies/page/{pg}"}, {"title": "TV shows", "url0": "https://simyflix.com/tv-series/", "url1": "https://simyflix.com/tv-series/page/{pg}"}], "vod_node": "//div[@class='row list-movie g-3']//div[@class='card border-0 shadow']", "vod_info": "//span[@class='mlbq']", "vod_score": "", "vod_title": "//h2", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://simyflix.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://simyflix.com/search/{wd}", "search_url_other_page": "https://simyflix.com/search/{wd}?page={pg}", "search_vod_node": "//div[@class='film_list-wrap']//div[@class='flw-item']", "search_vod_title": "//h2/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "//h2/a/@href", "search_vod_link_url": "https://simyflix.com{id}"};
-function ip61(e){
-const core=createIPlayrSpider(RULE_61,{key:"ip_myflixer"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_62 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "netflav", "episode_flag": false, "landscape_flag": true, "referer": "https://javplayer.me/", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "有码", "url0": "https://netflav.com/censored", "url1": "https://netflav.com/censored?page={pg}"}, {"title": "无码", "url0": "https://netflav.com/uncensored", "url1": "https://netflav.com/uncensored?page={pg}"}, {"title": "中文字幕", "url0": "https://netflav.com/chinese-sub", "url1": "https://netflav.com/chinese-sub?page={pg}"}], "vod_node": "//div[contains(@class, 'video_grid_container')]//div[@class='grid_0_cell']", "vod_info": "//div[@class='grid_0_date']", "vod_score": "", "vod_title": "//div[@class='grid_0_title']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://netflav.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://netflav.com/search?type=title&keyword={wd}", "search_url_other_page": "https://netflav.com/search?keyword={wd}&page={pg}&type=title", "search_vod_node": "//div[contains(@class, 'video_grid_container')]//div[@class='grid_0_cell']", "search_vod_title": "//div[@class='grid_0_title']", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://netflav.com{id}"};
-function ip62(e){
-const core=createIPlayrSpider(RULE_62,{key:"ip_netflav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_63 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "njavtv.com", "episode_flag": false, "landscape_flag": true, "referer": "https://javplayer.me/", "open_with_safari_flag": true, "category": [{"title": "新作上市", "url0": "https://njavtv.com/release", "url1": "https://njavtv.com/release?page={pg}"}, {"title": "最近更新", "url0": "https://njavtv.com/new", "url1": "https://njavtv.com/new?page={pg}"}], "vod_node": "//div[@class='thumbnail group']", "vod_info": "", "vod_score": "", "vod_title": "//a[contains(@class, 'text-secondary')]", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a[contains(@class, 'text-secondary')]/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://njavtv.com/cn/search/{wd}", "search_url_other_page": "https://njavtv.com/cn/search/{wd}?page={pg}", "search_vod_node": "//div[@class='thumbnail group']", "search_vod_title": "//a[contains(@class, 'text-secondary')]", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a[contains(@class, 'text-secondary')]/@href", "search_vod_link_url": "{id}"};
-function ip63(e){
-const core=createIPlayrSpider(RULE_63,{key:"ip_njavtvcom"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_64 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "novipnoa", "episode_flag": true, "landscape_flag": false, "referer": "https://www.novipnoad.net/", "cf_flag": true, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.novipnoad.net/movie/", "url1": "https://www.novipnoad.net/movie/page/{pg}/"}, {"title": "欧美剧", "url0": "https://www.novipnoad.net/tv/western/", "url1": "https://www.novipnoad.net/tv/western/page/{pg}/"}, {"title": "日剧", "url0": "https://www.novipnoad.net/tv/japan/", "url1": "https://www.novipnoad.net/tv/japan/page/{pg}/"}, {"title": "韩剧", "url0": "https://www.novipnoad.net/tv/korea/", "url1": "https://www.novipnoad.net/tv/korea/page/{pg}/"}, {"title": "港片", "url0": "https://www.novipnoad.net/tv/hongkong/", "url1": "https://www.novipnoad.net/tv/hongkong/page/{pg}/"}, {"title": "台片", "url0": "https://www.novipnoad.net/tv/taiwan/", "url1": "https://www.novipnoad.net/tv/taiwan/page/{pg}/"}], "vod_node": "//section[@class='video-listing']//div[contains(@class, 'video-item')]", "vod_info": "", "vod_score": "", "vod_title": "//h3//a", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "//table[@class='table table-bordered']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.novipnoad.net{id}", "playlist_info": "//div[@class='item-content toggled']/p", "search_flag": true, "search_url_first_page": "https://www.novipnoad.net/?s={wd}", "search_url_other_page": "https://www.novipnoad.net/page/{pg}/?s={wd}", "search_vod_node": "//div[@class='search-listing-content   ']//div[contains(@class, 'video-item')]", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3//a/@href", "search_vod_link_url": "{id}"};
-function ip64(e){
-const core=createIPlayrSpider(RULE_64,{key:"ip_novipnoa"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_65 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "欧乐影院", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "open_with_safari_flag": false, "category": [{"title": "电影", "url0": "https://www.olehdtv.com/index.php/vod/show/id/1.html", "url1": "https://www.olehdtv.com/index.php/vod/show/id/1/page/{pg}.html"}, {"title": "连续剧", "url0": "https://www.olehdtv.com/index.php/vod/show/id/2.html", "url1": "https://www.olehdtv.com/index.php/vod/show/id/2/page/{pg}.html"}, {"title": "综艺", "url0": "https://www.olehdtv.com/index.php/vod/show/id/3.html", "url1": "https://www.olehdtv.com/index.php/vod/show/id/3/page/{pg}.html"}, {"title": "动漫", "url0": "https://www.olehdtv.com/index.php/vod/show/id/4.html", "url1": "https://www.olehdtv.com/index.php/vod/show/id/4/page/{pg}.html"}], "vod_node": "//ul[contains(@class, 'vodlist')]//li", "vod_info": "", "vod_score": "//span[@class=' text_right text_dy']", "vod_title": "//p[@class='vodlist_title']//a/@title", "vod_image_id": "//a[contains(@class, 'vodlist_thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//p[@class='vodlist_title']//a/@href", "vod_link_url": "https://www.olehdtv.com{id}", "play_regex": "InVybCI6IihodHRwc1teIl0rKQ==", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[@class='content_playlist clearfix']", "playlist_title": "//li/a", "playlist_link_id": "//li/a/@href", "playlist_link_url": "https://www.olehdtv.com{id}", "playlist_info": "//li[contains(@class, 'desc')]", "search_flag": true, "search_url_first_page": "https://www.olehdtv.com/index.php/vod/search.html?wd={wd}&submit=", "search_url_other_page": "https://www.olehdtv.com/index.php/vod/search/page/{pg}/wd/{wd}.html", "search_vod_node": "//ul[contains(@class, 'vodlist')]//li", "search_vod_title": "//h4/a", "search_vod_image_id": "//a[contains(@class, 'vodlist_thumb')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4/a/@href", "search_vod_link_url": "https://www.olehdtv.com{id}"};
-function ip65(e){
-const core=createIPlayrSpider(RULE_65,{key:"ip_olevod"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_66 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "pektino", "episode_flag": false, "landscape_flag": true, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "新作上市", "url0": "https://pektino.com/zh-CN/weekly", "url1": "https://pektino.com/zh-CN/weekly?sort=favorite&page={pg}"}], "vod_node": "//div[@class='bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden mb-4']", "vod_info": "//div[@class='absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg']", "vod_score": "", "vod_title": "//img/@alt", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://pektino.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "", "search_vod_link_url": "{id}"};
-function ip66(e){
-const core=createIPlayrSpider(RULE_66,{key:"ip_pektino"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_67 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "pornfind[请搜索]", "episode_flag": false, "landscape_flag": true, "referer": "https://www.pornfind.cc", "open_with_safari_flag": true, "category": [{"title": "首页", "url0": "https://www.pornfind.cc/find/%E6%8E%A2%E8%8A%B1", "url1": "https://www.pornfind.cc/find/%E6%8E%A2%E8%8A%B1?page={pg}"}], "vod_node": "//div[contains(@id, 'videos')]//div[contains(@class, 'py-2')]", "vod_info": "", "vod_score": "", "vod_title": "//h5/a", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h5/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://www.pornfind.cc/search?q={wd}", "search_url_other_page": "https://www.pornfind.cc/find/{wd}?page={pg}", "search_vod_node": "//div[contains(@id, 'videos')]//div[contains(@class, 'py-2')]", "search_vod_title": "//h5/a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h5/a/@href", "search_vod_link_url": "{id}"};
-function ip67(e){
-const core=createIPlayrSpider(RULE_67,{key:"ip_pf"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_68 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "pigav", "episode_flag": false, "landscape_flag": true, "category": [{"title": "新作上市", "url0": "https://pigav.com/%e6%9c%80%e6%96%b0av%e7%b7%9a%e4%b8%8a%e7%9c%8b", "url1": "https://pigav.com/%E6%9C%80%E6%96%B0av%E7%B7%9A%E4%B8%8A%E7%9C%8B/page/{pg}/"}, {"title": "無碼", "url0": "https://pigav.com/%e7%84%a1%e7%a2%bcav%e7%b7%9a%e4%b8%8a%e7%9c%8b", "url1": "https://pigav.com/%e7%84%a1%e7%a2%bcav%e7%b7%9a%e4%b8%8a%e7%9c%8b/page/{pg}/"}, {"title": "熱門", "url0": "https://pigav.com/%e7%86%b1%e9%96%80av%e7%b7%9a%e4%b8%8a%e7%9c%8b", "url1": "https://pigav.com/%e7%86%b1%e9%96%80av%e7%b7%9a%e4%b8%8a%e7%9c%8b/page/{pg}/"}, {"title": "長片", "url0": "https://pigav.com/%e9%95%b7%e7%89%87av%e7%b7%9a%e4%b8%8a%e7%9c%8b", "url1": "https://pigav.com/%e9%95%b7%e7%89%87av%e7%b7%9a%e4%b8%8a%e7%9c%8b/page/{pg}/"}, {"title": "日韓", "url0": "https://pigav.com/%e6%97%a5%e9%9f%93av%e7%b7%9a%e4%b8%8a%e7%9c%8b", "url1": "https://pigav.com/%e6%97%a5%e9%9f%93av%e7%b7%9a%e4%b8%8a%e7%9c%8b/page/{pg}/"}], "vod_node": "//div[contains(@class, 'block-content')]//article", "vod_info": "", "vod_score": "", "vod_title": "//h2/a", "vod_image_id": "//span[contains(@class, 'wp-post-image')]/@data-bgsrc", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h2/a/@href", "vod_link_url": "{id}", "play_regex": "c291cmNlIHNyYz0iKFteIl0rKQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://pigav.com/?s={wd}", "search_url_other_page": "https://pigav.com/page/{pg}?s={wd}", "search_vod_node": "//div[contains(@class, 'block-content')]//article", "search_vod_title": "//h2/a", "search_vod_image_id": "//span[contains(@class, 'wp-post-image')]/@data-bgsrc", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h2/a/@href", "search_vod_link_url": "{id}"};
-function ip68(e){
-const core=createIPlayrSpider(RULE_68,{key:"ip_pigav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_69 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "pomo.mom", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "首页", "url0": "https://pomo.mom/", "url1": "https://pomo.mom/page/{pg}"}, {"title": "剧集", "url0": "https://pomo.mom/dianshiju", "url1": "https://pomo.mom/dianshiju/page/{pg}"}, {"title": "华语热门", "url0": "https://pomo.mom/huayurm", "url1": "https://pomo.mom/huayurm/page/{pg}"}, {"title": "家庭影院", "url0": "https://pomo.mom/jiatingu", "url1": "https://pomo.mom/jiatingu/page/{pg}"}, {"title": "动画大电影", "url0": "https://pomo.mom/donghuadadiany", "url1": "https://pomo.mom/donghuadadiany/page/{pg}"}, {"title": "华语热门", "url0": "https://pomo.mom/huayurm", "url1": "https://pomo.mom/huayurm/page/{pg}"}], "vod_node": "//a[@class='block h-full flex flex-col']", "vod_info": "", "vod_score": "//span[@class='highlight']", "vod_title": "//h3", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "f", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://pomo.mom/?keyword={wd}", "search_url_other_page": "https://pomo.mom/?keyword={wd}&page={pg}", "search_vod_node": "//a[@class='block h-full flex flex-col']", "search_vod_title": "//h3", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "{id}"};
-function ip69(e){
-const core=createIPlayrSpider(RULE_69,{key:"ip_pomo"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_70 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "ppnix", "episode_flag": true, "landscape_flag": false, "referer": "", "ijk_flag": true, "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.ppnix.com/cn/movie/", "url1": "https://www.ppnix.com/cn/movie/---{pg}-.html"}, {"title": "剧集", "url0": "https://www.ppnix.com/cn/tv/", "url1": "https://www.ppnix.com/cn/tv/---{pg}-.html"}], "vod_node": "//div[@class='lists-content']//li", "vod_info": "//span[@class='orange']", "vod_score": "//span[@class='rate']", "vod_title": "//h2//a", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h2//a/@href", "vod_link_url": "https://www.ppnix.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://www.ppnix.com/cn/search/{wd}--.html", "search_url_other_page": "https://www.ppnix.com/cn/search/{wd}-{pg}-.html", "search_vod_node": "//div[@class='lists-content']//li", "search_vod_title": "//h2//a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h2//a/@href", "search_vod_link_url": "https://www.ppnix.com{id}"};
-function ip70(e){
-const core=createIPlayrSpider(RULE_70,{key:"ip_ppnix"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_71 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "ppp", "episode_flag": false, "landscape_flag": true, "referer": "", "category": [{"title": "新作上市", "url0": "https://ppp.porn/new/", "url1": "https://ppp.porn/new/{pg}/"}], "vod_node": "//div[contains(@id, 'list_videos_latest_videos_list_items')]//div[contains(@class, 'card-video')]", "vod_info": "", "vod_score": "", "vod_title": "//h4//a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h4//a/@href", "vod_link_url": "{id}", "play_regex": "c3RyZWFtID0gJyhodHRwW14nXSsp", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://ppp.porn/search/?q={wd}", "search_url_other_page": "https://ppp.porn/search/?q={wd}&from_videos={pg}", "search_vod_node": "//section[contains(@id, 'list_videos_videos_list_search_result')]//div[contains(@class, 'card-video')]", "search_vod_title": "//h4//a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4//a/@href", "search_vod_link_url": "{id}"};
-function ip71(e){
-const core=createIPlayrSpider(RULE_71,{key:"ip_ppp"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_72 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "趣动漫", "info": "已失效，网站已挂", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", "open_with_safari_flag": true, "category": [{"title": "日本动漫", "url0": "https://www.qdm8.com/type/riman.html", "url1": "https://www.qdm8.com/type/riman-{pg}.html"}, {"title": "国产动漫", "url0": "https://www.qdm8.com/type/guoman.html", "url1": "https://www.qdm8.com/type/guoman-{pg}.html"}, {"title": "动漫电影", "url0": "https://www.qdm8.com/type/dmdianying.html", "url1": "https://www.qdm8.com/type/dmdianying-{pg}.html"}, {"title": "欧美动漫", "url0": "https://www.qdm8.com/type/oman.html", "url1": "https://www.qdm8.com/type/oman-{pg}.html"}], "vod_node": "//ul[contains(@class, 'myui-vodlist')]//li", "vod_info": "//span[@class='pic-text text-right']", "vod_score": "", "vod_title": "//h4//a", "vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h4//a/@href", "vod_link_url": "https://www.qdm8.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'myui-content__list')]", "playlist_title": "//li/a", "playlist_link_id": "//li/a/@href", "playlist_link_url": "https://www.qdm8.com{id}", "playlist_info": "//p[@class='data hidden-xs']", "search_flag": true, "search_url_first_page": "https://www.qdm8.com/search/-------------.html?wd={wd}&submit=", "search_url_other_page": "https://www.qdm8.com/search/{wd}----------{pg}---.html", "search_vod_node": "//ul[contains(@class, 'myui-vodlist__media')]//li", "search_vod_title": "//h4//a", "search_vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4//a/@href", "search_vod_link_url": "https://www.qdm8.com{id}"};
-function ip72(e){
-const core=createIPlayrSpider(RULE_72,{key:"ip_qdm"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_73 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "qifun", "episode_flag": true, "landscape_flag": false, "referer": "", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "TV动画", "url0": "https://www.qifun.cc/vodtype/1.html", "url1": "https://www.qifun.cc/vodtype/1-{pg}.html"}], "vod_node": "//div[@class='video-img-box mb-e-20']", "vod_info": "", "vod_score": "", "vod_title": "//h6//a", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h6//a/@href", "vod_link_url": "https://www.qifun.cc{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@id='playsx']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.qifun.cc{id}", "playlist_info": "//div[@class='info info-content']", "search_flag": true, "search_url_first_page": "https://www.qifun.cc/vodsearch/-------------.html?wd={wd}", "search_url_other_page": "https://www.qifun.cc/vodsearch/{wd}----------{pg}---.html", "search_vod_node": "//div[@class='video-img-box mb-e-20']", "search_vod_title": "//h6//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h6//a/@href", "search_vod_link_url": "https://www.qifun.cc{id}"};
-function ip73(e){
-const core=createIPlayrSpider(RULE_73,{key:"ip_qifun"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_74 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "renren.pro", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": false, "category": [{"title": "影视库", "url0": "https://www.renren.pro/list/all", "url1": "https://www.renren.pro/list/all?page={pg}"}], "vod_node": "//div[contains(@class, 'module-list')]//div[@class='module-item']", "vod_info": "//div[@class='module-item-text']", "vod_score": "", "vod_title": "//div[@class='module-item-titlebox']/a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='module-item-titlebox']/a/@href", "vod_link_url": "https://www.renren.pro{id}", "play_regex": "dXJsOiAiKFteIl0rbTN1OCk=", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[@class='module-blocklist']", "playlist_title": "//a/span", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.renren.pro{id}", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://www.renren.pro/search?wd={wd}", "search_url_other_page": "https://www.renren.pro/search?wd={wd}&pg={pg}", "search_vod_node": "//div[contains(@class, 'module-list')]//div[@class='module-search-item']", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "https://www.renren.pro{id}"};
-function ip74(e){
-const core=createIPlayrSpider(RULE_74,{key:"ip_renrenpro"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_75 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "rou.video", "episode_flag": false, "landscape_flag": true, "ijk_flag": true, "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", "referer": "https://rou.video/", "open_with_safari_flag": true, "category": [{"title": "新作上市", "url0": "https://rou.video/v", "url1": "https://rou.video/v?order=createdAt&page={pg}"}], "vod_node": "//a[@class='group block min-w-0']", "vod_info": "//span[contains(@class, 'right-2.5')]", "vod_score": "", "vod_title": "//h3", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://rou.video{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://rou.video/search?q={wd}", "search_url_other_page": "https://rou.video/search?q={wd}&page={pg}", "search_vod_node": "//*[@id='__next']//div[contains(@class, 'aspect-video')]", "search_vod_title": "//img[contains(@class, 'relative')]/@alt", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://rou.video{id}"};
-function ip75(e){
-const core=createIPlayrSpider(RULE_75,{key:"ip_rou"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_76 = {"uuid": "76d49e34-b2ef-4b9d-911f-77c445c63940", "title": "stream movie", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": false, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1", "pageSize": 1, "category": [{"title": "movie", "url0": "https://dexter.pw/api/browse?type=movie&page=1&site=dexter", "url1": "https://dexter.pw/api/browse?type=movie&page={pg}&site=dexter"}], "vod_node": "$.results[*]", "vod_info": "year", "vod_score": "rating", "vod_title": "title", "vod_image_id": "poster", "vod_image_url": "https://image.tmdb.org/t/p/w500{id}", "vod_link_id": "id", "vod_link_url": "https://dexter.pw/api/movie/{id}?site=dexter", "playlist_flag": true, "playlist_group_node": "$.sources[*]", "playlist_title": "label", "playlist_info": "$.overview", "playlist_link_id": "url", "playlist_link_url": "https://dexter.pw{id}", "search_flag": false, "search_url_first_page": "https://dexter.pw/api/search?q={wd}&type=all&page=1&site=dexter", "search_url_other_page": "https://dexter.pw/api/search?q={wd}&type=all&page={pg}&site=dexter", "search_vod_node": "$.results[*]", "search_vod_title": "title", "search_vod_image_id": "poster", "search_vod_image_url": "https://image.tmdb.org/t/p/w500{id}", "search_vod_link_id": "id", "search_vod_link_url": "https://dexter.pw/api/tv/{id}"};
-function ip76(e){
-const core=createIPlayrSpider(RULE_76,{key:"ip_stream_movie"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_77 = {"uuid": "76d49e34-b2ef-4b9d-911f-77c445c63940", "title": "stream tv", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": false, "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1", "pageSize": 1, "category": [{"title": "tv", "url0": "https://dexter.pw/api/browse?type=tv&page=1", "url1": "https://dexter.pw/api/browse?type=tv&page={pg}"}], "vod_node": "$.results[*]", "vod_title": "title", "vod_image_id": "poster", "vod_image_url": "https://image.tmdb.org/t/p/w500{id}", "vod_link_id": "id", "vod_link_url": "https://dexter.pw/api/tv/{id}", "playlist_flag": true, "playlist_group_node": "$.seasonList[*]", "playlist_title": "name", "playlist_info": "$.overview", "playlist_link_id": "number", "playlist_link_url": "https://dexter.pw/api/tv/{showId}/season/{id}", "playlist_sub_group_node": "$.episodes[*]", "playlist_sub_title": "title", "playlist_sub_info": "$.overview", "playlist_sub_link_id": "episode", "playlist_sub_link_url": "https://dexter.pw/api/tv/{showId}/episode/{season}/{id}", "play_node": "$.sources[*]", "play_link_id": "url", "play_source_url": "https://dexter.pw{id}", "search_flag": true, "search_url_first_page": "https://dexter.pw/api/search?q={wd}&type=all&page=1&site=dexter", "search_url_other_page": "https://dexter.pw/api/search?q={wd}&type=all&page={pg}&site=dexter", "search_vod_node": "$.results[*]", "search_vod_title": "title", "search_vod_image_id": "poster", "search_vod_image_url": "https://image.tmdb.org/t/p/w500{id}", "search_vod_link_id": "id", "search_vod_link_url": "https://dexter.pw/api/tv/{id}"};
-function ip77(e){
-const core=createIPlayrSpider(RULE_77,{key:"ip_stream_tv"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_78 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "素白白", "episode_flag": true, "landscape_flag": false, "referer": "https://www.subaibai.com", "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.subaibai.com/new-movie", "url1": "https://www.subaibai.com/new-movie/page/{pg}"}, {"title": "美剧", "url0": "https://www.subaibai.com/american-drama", "url1": "https://www.subaibai.com/american-drama/page/{pg}"}, {"title": "国产剧", "url0": "https://www.subaibai.com/domestic-drama", "url1": "https://www.subaibai.com/domestic-drama/page/{pg}"}, {"title": "韩剧", "url0": "https://www.subaibai.com/korean-drama", "url1": "https://www.subaibai.com/korean-drama/page/{pg}"}, {"title": "动漫电影", "url0": "https://www.subaibai.com/cartoon-movie", "url1": "https://www.subaibai.com/cartoon-movie/page/{pg}"}, {"title": "动漫", "url0": "https://www.subaibai.com/anime-drama", "url1": "https://www.subaibai.com/anime-drama/page/{pg}"}], "vod_node": "//div[@class='mikd']//div[contains(@class, 'bt_img')]//ul//li", "vod_info": "//div[@class='rating']", "vod_score": "//span[@class='qb']", "vod_title": "//h3/a", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3/a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "", "playlist_flag": true, "playlist_group_node": "//div[@class='mi_paly_box']//div[@class='paly_list_btn']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "{id}", "playlist_info": "//div[@class='yp_context']", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip78(e){
-const core=createIPlayrSpider(RULE_78,{key:"ip_subaibaiys"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_79 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "supjav", "episode_flag": false, "landscape_flag": true, "referer": "https://emturbovid.com/", "open_with_safari_flag": true, "category": [{"title": "censored", "url0": "https://supjav.com/category/censored-jav", "url1": "https://supjav.com/category/censored-jav/page/{pg}"}, {"title": "uncensored", "url0": "https://supjav.com/category/uncensored-jav", "url1": "https://supjav.com/category/uncensored-jav/page/{pg}"}, {"title": "amateur", "url0": "https://supjav.com/category/amateur", "url1": "https://supjav.com/category/amateur/page/{pg}"}, {"title": "chinese-subtitles", "url0": "https://supjav.com/category/chinese-subtitles", "url1": "https://supjav.com/category/chinese-subtitles/page/{pg}"}, {"title": "reducing-mosaic", "url0": "https://supjav.com/category/reducing-mosaic", "url1": "https://supjav.com/category/reducing-mosaic/page/{pg}"}, {"title": "english-subtitles", "url0": "https://supjav.com/category/english-subtitles", "url1": "https://supjav.com/category/english-subtitles/page/{pg}"}], "vod_node": "//div[contains(@class, 'posts')]//div[contains(@class, 'post')]", "vod_info": "//div[@class='meta']", "vod_score": "", "vod_title": "//h3//a", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h3//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://supjav.com/?s={wd}", "search_url_other_page": "https://supjav.com/page/{pg}?s={wd}", "search_vod_node": "//div[contains(@class, 'posts')]//div[contains(@class, 'post')]", "search_vod_title": "//h3//a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3//a/@href", "search_vod_link_url": "{id}"};
-function ip79(e){
-const core=createIPlayrSpider(RULE_79,{key:"ip_supjav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_80 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "thaiav", "episode_flag": false, "landscape_flag": true, "referer": "https://javplayer.me/", "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://taiav.com/cn/news", "url1": "https://taiav.com/cn/news?page={pg}"}], "vod_node": "//div[contains(@class, 'videos-lists')]//div[@data-date='no']", "vod_info": "//time", "vod_score": "//div[@class='count']", "vod_title": "//h5", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://taiav.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip80(e){
-const core=createIPlayrSpider(RULE_80,{key:"ip_thaiav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_81 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "theav", "episode_flag": false, "landscape_flag": true, "cf_flag": true, "category": [{"title": "日本", "url0": "https://theav.xyz/jav", "url1": "https://theav.xyz/jav/{pg}"}, {"title": "日本无码", "url0": "https://theav.xyz/jav/uncensored", "url1": "https://theav.xyz/jav/uncensored/{pg}"}, {"title": "欧美", "url0": "https://theav.xyz/eu", "url1": "https://theav.xyz/eu/{pg}"}], "vod_node": "//div[@class='v3-video-card']", "vod_info": "//span[@class='v3-badge v3-badge-resolution']", "vod_score": "//span[@class='v3-badge v3-badge-duration']", "vod_title": "//div[@class='v3-video-title']", "vod_image_id": "//source/@srcset", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://theav.xyz{id}", "play_regex": "bTN1OF91cmwiOiAiKFteIl0rKQ==", "play_url": "https://theav.xyz{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://theav.xyz/search/{wd}", "search_url_other_page": "https://theav.xyz/search/{wd}/{pg}", "search_vod_node": "//div[@class='v3-video-card']", "search_vod_title": "//div[@class='v3-video-title']", "search_vod_image_id": "//source/@srcset", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://theav.xyz{id}"};
-function ip81(e){
-const core=createIPlayrSpider(RULE_81,{key:"ip_theav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_82 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "tktube", "episode_flag": false, "landscape_flag": true, "open_with_safari_flag": true, "category": [{"title": "最近更新", "url0": "https://www.tktube.com/latest-updates/", "url1": "https://www.tktube.com/latest-updates/{pg}/"}], "vod_node": "//div[contains(@class, 'list-videos')]//div[contains(@class, 'item')]", "vod_info": "//div[contains(@class, 'added')]//em", "vod_score": "//div[contains(@class,'duration')]", "vod_title": "//strong[@class='title']", "vod_image_id": "//img/@data-webp", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip82(e){
-const core=createIPlayrSpider(RULE_82,{key:"ip_tktube"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_83 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "tktube无解析版", "episode_flag": false, "landscape_flag": true, "category": [{"title": "最近更新", "url0": "https://www.tktube.com/latest-updates/", "url1": "https://www.tktube.com/latest-updates/{pg}/"}], "vod_node": "//div[contains(@class, 'list-videos')]//div[contains(@class, 'item')]", "vod_info": "//div[contains(@class, 'added')]//em", "vod_score": "//div[contains(@class,'duration')]", "vod_title": "//strong[@class='title']", "vod_image_id": "//img/@data-webp", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "dmlkZW9fYWx0X3VybDogJ2Z1bmN0aW9uXC8wXC8oW14nXSspJw==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip83(e){
-const core=createIPlayrSpider(RULE_83,{key:"ip_tktube2"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_84 = {"uuid": "76d49e34-b2ef-4b9d-911f-77c445c63940", "title": "twikeep", "episode_flag": false, "landscape_flag": true, "referer": "", "open_with_safari_flag": false, "pageSize": 25, "category": [{"title": "最近更新", "url0": "https://www.twikeep.com/api/history?cursor=0&limit=20&sort=latest&unique=0", "url1": "https://www.twikeep.com/api/history?cursor={start}&limit=20&sort=latest&unique=0"}], "vod_node": "$.items[*]", "vod_info": "", "vod_score": "", "vod_title": "userName", "vod_image_id": "thumbnailUrl", "vod_image_url": "{id}", "vod_link_id": "bestVideoUrl", "vod_link_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "{id}", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_url": "{id}", "search_vod_link_id": "", "search_vod_link_url": "{id}"};
-function ip84(e){
-const core=createIPlayrSpider(RULE_84,{key:"ip_twikeep"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_85 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "twitter-ero-video-ranking", "episode_flag": false, "landscape_flag": true, "referer": "", "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15", "category": [{"title": "每日", "url0": "https://twitter-ero-video-ranking.com/zh-CN", "url1": "https://twitter-ero-video-ranking.com/zh-CN?sort=favorite&page={pg}"}, {"title": "每周", "url0": "https://twitter-ero-video-ranking.com/zh-CN/weekly", "url1": "https://twitter-ero-video-ranking.com/zh-CN/weekly?sort=favorite&page={pg}"}, {"title": "每月", "url0": "https://twitter-ero-video-ranking.com/zh-CN/monthly", "url1": "https://twitter-ero-video-ranking.com/zh-CN/monthly?sort=favorite&page={pg}"}, {"title": "所有", "url0": "https://twitter-ero-video-ranking.com/zh-CN/all", "url1": "https://twitter-ero-video-ranking.com/zh-CN/all?sort=favorite&page={pg}"}], "vod_node": "//div[@class='bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-hidden mb-4']", "vod_info": "", "vod_score": "", "vod_title": "//div[@class='absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "https://twitter-ero-video-ranking.com{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://twitter-ero-video-ranking.com{id}", "play_regex": "Y29udGVudFVybCI6IihbXiJdKyk=", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip85(e){
-const core=createIPlayrSpider(RULE_85,{key:"ip_twitter"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_86 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "wantav", "episode_flag": false, "landscape_flag": true, "referer": "https://wantav.com/", "category": [{"title": "新作上市", "url0": "https://missavt.com/sort/renew/", "url1": "https://missavt.com/sort/renew/{pg}/"}], "vod_node": "//ul[contains(@class,'video-items')]//li", "vod_info": "", "vod_score": "", "vod_title": "//a[@class='my-1 md:my-2 line-clamp-2']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a[@class='my-1 md:my-2 line-clamp-2']/@href", "vod_link_url": "https://missavt.com{id}", "play_regex": "aGxzVXJsID0gIihbXiJdKyk=", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://wantav.com/search/index/keyword/{wd}", "search_url_other_page": "https://wantav.com/search/index/keyword/{wd}/page/{pg}", "search_vod_node": "//div[@class='video-item']", "search_vod_title": "//h2//a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h2//a/@href", "search_vod_link_url": "https://wantav.com{id}"};
-function ip86(e){
-const core=createIPlayrSpider(RULE_86,{key:"ip_wantav"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_87 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "whos.tv", "episode_flag": false, "landscape_flag": true, "referer": "", "cf_flag": true, "open_with_safari_flag": false, "category": [{"title": "影片库", "url0": "https://whos.tv/videos", "url1": "https://whos.tv/videos/page-{pg}"}], "vod_node": "//div[@id='video-directory__grid']/a", "vod_info": "//span[@class='shrink-0']", "vod_score": "//span[@class='min-w-0 truncate text-right']", "vod_title": "//h3", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://whos.tv{id}", "play_regex": "c3JjPSIoW14iXSttM3U4KQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://whos.tv/result?serach={wd}", "search_url_other_page": "https://whos.tv/result/page-{pg}?serach={wd}", "search_vod_node": "//a[contains(@class, 'group')]", "search_vod_title": "//h3", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "https://whos.tv{id}"};
-function ip87(e){
-const core=createIPlayrSpider(RULE_87,{key:"ip_whostv"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_88 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "xgroovy", "episode_flag": false, "landscape_flag": true, "open_with_safari_flag": false, "category": [{"title": "Newest", "url0": "https://cn.xgroovy.com/new/", "url1": "https://cn.xgroovy.com/new/{pg}/"}, {"title": "Chinese", "url0": "https://cn.xgroovy.com/categories/chinese/", "url1": "https://cn.xgroovy.com/categories/chinese/{pg}/"}, {"title": "Japanese", "url0": "https://cn.xgroovy.com/categories/japanese/", "url1": "https://cn.xgroovy.com/categories/japanese/{pg}/"}, {"title": "Asian", "url0": "https://cn.xgroovy.com/categories/asian/", "url1": "https://cn.xgroovy.com/categories/asian/{pg}/"}, {"title": "Creampie", "url0": "https://cn.xgroovy.com/categories/creampie/", "url1": "https://cn.xgroovy.com/categories/creampie/{pg}/"}], "vod_node": "//div[@class='list-videos']//div[@class='item   ']", "vod_info": "//div[@class='views']", "vod_score": "//div[contains(@class, 'duration')]", "vod_title": "//strong[@class='title']", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "{id}", "play_regex": "c3JjPSIoaHR0cHNbXiJdKzcyMHBcLm1wND8p", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://cn.xgroovy.com/search/{wd}/", "search_url_other_page": "https://cn.xgroovy.com/search/{wd}/{pg}/", "search_vod_node": "//div[@class='list-videos']//div[@class='item   ']", "search_vod_title": "//strong[@class='title']", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//a/@href", "search_vod_link_url": "{id}"};
-function ip88(e){
-const core=createIPlayrSpider(RULE_88,{key:"ip_xgroovy"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_89 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "小宝影院", "episode_flag": true, "landscape_flag": false, "referer": "", "category": [{"title": "电影", "url0": "https://xiaoxintv.cc/index.php/vod/type/id/7.html", "url1": "https://xiaoxintv.cc/index.php/vod/type/id/7/page/{pg}.html"}, {"title": "电视剧", "url0": "https://xiaoxintv.cc/index.php/vod/type/id/6.html", "url1": "https://xiaoxintv.cc/index.php/vod/type/id/6/page/{pg}.html"}, {"title": "动漫", "url0": "https://xiaoxintv.cc/index.php/vod/type/id/5.html", "url1": "https://xiaoxintv.cc/index.php/vod/type/id/5/page/{pg}.html"}, {"title": "综艺", "url0": "https://xiaoxintv.cc/index.php/vod/type/id/3.html", "url1": "https://xiaoxintv.cc/index.php/vod/type/id/3/page/{pg}.html"}, {"title": "纪录片", "url0": "https://xiaoxintv.cc/index.php/vod/type/id/21.html", "url1": "https://xiaoxintv.cc/index.php/vod/type/id/21/page/{pg}.html"}], "vod_node": "//ul[contains(@class, 'myui-vodlist')]//li", "vod_info": "//span[contains(@class, 'tag')]", "vod_score": "", "vod_title": "//h4/a", "vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "https://xiaoxintv.cc{id}", "vod_link_id": "//h4/a/@href", "vod_link_url": "https://xiaoxintv.cc{id}", "play_regex": "InVybCI6IihodHRwW14iXSsp", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'myui-content__list')]", "playlist_title": "//li/a", "playlist_link_id": "//li/a/@href", "playlist_link_url": "https://xiaoxintv.cc{id}", "playlist_info": "//span[contains(@class, 'content')]", "search_flag": true, "search_url_first_page": "https://xiaoxintv.cc/index.php/vod/search.html?wd={wd}&submit=", "search_url_other_page": "https://xiaoxintv.cc/index.php/vod/search/page/{pg}/wd/{wd}.html", "search_vod_node": "//ul[contains(@class, 'myui-vodlist__media')]//li", "search_vod_title": "//h4/a", "search_vod_image_id": "//a[contains(@class, 'myui-vodlist__thumb')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "https://xiaoxintv.cc{id}", "search_vod_link_id": "//h4/a/@href", "search_vod_link_url": "https://xiaoxintv.cc{id}"};
-function ip89(e){
-const core=createIPlayrSpider(RULE_89,{key:"ip_xiaobao"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_90 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "西瓜影视", "episode_flag": true, "landscape_flag": false, "referer": "https://sszzyy.com/", "enable_cache_flag": false, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://sszzyy.com/index.php/vod/type/id/20.html", "url1": "https://sszzyy.com/index.php/vod/type/id/20/page/{pg}.html"}, {"title": "剧集", "url0": "https://sszzyy.com/index.php/vod/type/id/37.html", "url1": "https://sszzyy.com/index.php/vod/type/id/37/page/{pg}.html"}, {"title": "综艺", "url0": "https://sszzyy.com/index.php/vod/type/id/45.html", "url1": "https://sszzyy.com/index.php/vod/type/id/45/page/{pg}.html"}, {"title": "动漫", "url0": "https://sszzyy.com/index.php/vod/type/id/43.html", "url1": "https://sszzyy.com/index.php/vod/type/id/43/page/{pg}.html"}], "vod_node": "//ul[@class='stui-vodlist clearfix']//li", "vod_info": "", "vod_score": "", "vod_title": "//h4//a", "vod_image_id": "//a[contains(@class, 'stui-vodlist__thumb')]/@data-original", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h4//a/@href", "vod_link_url": "https://sszzyy.com{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//ul[contains(@class, 'stui-content__playlist')]", "playlist_title": "//li//a", "playlist_link_id": "//li//a/@href", "playlist_link_url": "https://sszzyy.com{id}", "playlist_info": "//p[@class='desc detail']", "search_flag": true, "search_url_first_page": "https://sszzyy.com/index.php/vod/search/page/1/wd/{wd}.html", "search_url_other_page": "https://sszzyy.com/index.php/vod/search/page/{pg}/wd/{wd}.html", "search_vod_node": "//ul[@class='stui-vodlist clearfix']//li", "search_vod_title": "//h4//a", "search_vod_image_id": "//a[contains(@class, 'stui-vodlist__thumb')]/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h4//a/@href", "search_vod_link_url": "https://sszzyy.com{id}"};
-function ip90(e){
-const core=createIPlayrSpider(RULE_90,{key:"ip_xigua"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_91 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "xxjoa", "episode_flag": false, "landscape_flag": true, "vod_referer_flag": true, "open_with_safari_flag": true, "category": [{"title": "XX조아", "url0": "https://xxjoa49.com/", "url1": "https://xxjoa49.com/page/{pg}/"}], "vod_node": "//article", "vod_info": "", "vod_score": "", "vod_title": "//h2//a", "vod_image_id": "//img/@src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//h2//a/@href", "vod_link_regex": "", "vod_link_url": "https://xxjoa49.com{id}", "play_regex": "c291cmNlIHNyYz0iKFteIl0rKQ==", "play_url": "{id}", "playlist_flag": false, "playlist_group_node": "", "playlist_title": "", "playlist_link_id": "", "playlist_link_url": "", "playlist_info": "", "search_flag": true, "search_url_first_page": "https://xxjoa49.com/?s={wd}", "search_url_other_page": "https://xxjoa49.com/page/{pg}/?s={wd}", "search_vod_node": "//article", "search_vod_title": "//h2//a", "search_vod_image_id": "//img/@src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h2//a/@href", "search_vod_link_regex": "", "search_vod_link_url": "{id}"};
-function ip91(e){
-const core=createIPlayrSpider(RULE_91,{key:"ip_xxjoa16"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_92 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "爱一帆", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "电影", "url0": "https://www.yfsp.tv/list/movie", "url1": "https://www.yfsp.tv/list/movie?page={pg}"}, {"title": "剧集", "url0": "https://www.yfsp.tv/list/drama", "url1": "https://www.yfsp.tv/list/drama?page={pg}"}, {"title": "动漫", "url0": "https://www.yfsp.tv/list/anime", "url1": "https://www.yfsp.tv/list/anime?page={pg}"}, {"title": "记录片", "url0": "https://www.yfsp.tv/list/documentary", "url1": "https://www.yfsp.tv/list/documentary?page={pg}"}, {"title": "综艺", "url0": "https://www.yfsp.tv/list/variety", "url1": "https://www.yfsp.tv/list/variety?page={pg}"}], "vod_node": "//ul[@class='video_list']//li", "vod_info": "//", "vod_score": "//div[@class='score visbile']", "vod_title": "//h3", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.yfsp.tv{id}", "play_regex": "", "play_url": "", "playlist_flag": false, "playlist_group_node": "//div[@class='n-media-list']//a", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.yfsp.tv{id}", "playlist_info": "//div[contains(@class, 'summary')]", "search_flag": false, "search_url_first_page": "", "search_url_other_page": "", "search_vod_node": "", "search_vod_title": "", "search_vod_image_id": "", "search_vod_image_regex": "", "search_vod_image_url": "", "search_vod_link_id": "", "search_vod_link_url": ""};
-function ip92(e){
-const core=createIPlayrSpider(RULE_92,{key:"ip_yfsp"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_93 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "youknow.tv", "episode_flag": true, "landscape_flag": false, "referer": "", "open_with_safari_flag": true, "category": [{"title": "剧集", "url0": "https://www.youknow.tv/show/1-----------/", "url1": "https://www.youknow.tv/show/1--------{pg}---/"}, {"title": "电影", "url0": "https://www.youknow.tv/show/2-----------/", "url1": "https://www.youknow.tv/show/2--------{pg}---/"}, {"title": "综艺", "url0": "https://www.youknow.tv/show/3-----------/", "url1": "https://www.youknow.tv/show/3--------{pg}---/"}, {"title": "动漫", "url0": "https://www.youknow.tv/show/4-----------/", "url1": "https://www.youknow.tv/show/4--------{pg}---/"}], "vod_node": "//a[contains(@class, 'module-poster-item')]", "vod_info": "//div[@class='module-item-note']", "vod_score": "", "vod_title": "//div[@class='module-poster-item-title']", "vod_image_id": "//img/@data-original", "vod_image_regex": "", "vod_image_url": "https://www.youknow.tv{id}", "vod_link_id": "//a/@href", "vod_link_url": "https://www.youknow.tv{id}", "play_regex": "", "play_url": "{id}", "playlist_flag": true, "playlist_group_node": "//div[contains(@class, 'module-play-list')]", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.youknow.tv{id}", "playlist_info": "//div[contains(@class, 'module-info-introduction')]", "search_flag": true, "search_url_first_page": "https://www.youknow.tv/vodsearch/-------------/?wd={wd}", "search_url_other_page": "https://www.youknow.tv/vodsearch/{wd}----------{pg}---/", "search_vod_node": "//div[@class='module-card-item module-item']", "search_vod_title": "//div[@class='module-card-item-title']/a", "search_vod_image_id": "//img/@data-original", "search_vod_image_regex": "", "search_vod_image_url": "https://www.youknow.tv{id}", "search_vod_link_id": "//div[@class='module-card-item-title']/a/@href", "search_vod_link_url": "https://www.youknow.tv{id}"};
-function ip93(e){
-const core=createIPlayrSpider(RULE_93,{key:"ip_youknow"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-const RULE_94 = {"uuid": "6ed73adf-8c3e-46dd-a8cd-64a7dfe491d2", "title": "子子影视", "episode_flag": true, "landscape_flag": false, "referer": "", "cf_flag": true, "open_with_safari_flag": true, "category": [{"title": "国产剧", "url0": "https://www.ziziys.org/list/13.html", "url1": "https://www.ziziys.org/list/13-{pg}.html"}, {"title": "美剧", "url0": "https://www.ziziys.org/list/14.html", "url1": "https://www.ziziys.org/list/14-{pg}.html"}, {"title": "日韩剧", "url0": "https://www.ziziys.org/list/15.html", "url1": "https://www.ziziys.org/list/15-{pg}.html"}, {"title": "国漫", "url0": "https://www.ziziys.org/list/20.html", "url1": "https://www.ziziys.org/list/20-{pg}.html"}, {"title": "日漫", "url0": "https://www.ziziys.org/list/21.html", "url1": "https://www.ziziys.org/list/21-{pg}.html"}, {"title": "欧美漫", "url0": "https://www.ziziys.org/list/22.html", "url1": "https://www.ziziys.org/list/22-{pg}.html"}], "vod_node": "//div[@class='module-items']//div[@class='module-item']", "vod_info": "//div[@class='module-item-text']", "vod_score": "", "vod_title": "//div[@class='module-item-titlebox']/a", "vod_image_id": "//img/@data-src", "vod_image_regex": "", "vod_image_url": "{id}", "vod_link_id": "//div[@class='module-item-titlebox']/a/@href", "vod_link_url": "https://www.ziziys.org{id}", "play_regex": "", "play_url": "", "playlist_flag": true, "playlist_group_node": "//div[@class='scroll-content']", "playlist_title": "//a", "playlist_link_id": "//a/@href", "playlist_link_url": "https://www.ziziys.com{id}", "playlist_info": "//div[@class='video-info-item video-info-content vod_content']/span", "search_flag": true, "search_url_first_page": "https://www.ziziys.org/vsearch/--.html?wd={wd}", "search_url_other_page": "https://www.ziziys.org/vsearch/{wd}--{pg}.html", "search_vod_node": "//div[@class='module-items']//div[@class='module-search-item']", "search_vod_title": "//h3/a", "search_vod_image_id": "//img/@data-src", "search_vod_image_regex": "", "search_vod_image_url": "{id}", "search_vod_link_id": "//h3/a/@href", "search_vod_link_url": "https://www.ziziys.org{id}"};
-function ip94(e){
-const core=createIPlayrSpider(RULE_94,{key:"ip_zizi"});
-const spider={
-meta:core.meta,
-setProxyBase(url){return core.setProxyBase(url);},
-init(req){let b=(req&&req.body)||{};return core.init(b.extend||b.ext||b);},
-home(req){let b=(req&&req.body)||{};return core.home(b.filter);},
-homeVod(req){return core.homeVod();},
-homeVideo(req){return core.homeVod();},
-category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.page||b.pg||1,b.filters,b.extend);},
-detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
-search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
-play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
-destroy(){return core.destroy();}
-};
-return spider;
-}
-
-function xh0(e){return[ip0(e),ip1(e),ip2(e),ip3(e),ip4(e),ip5(e),ip6(e),ip7(e),ip8(e),ip9(e),ip10(e),ip11(e),ip12(e),ip13(e),ip14(e),ip15(e),ip16(e),ip17(e),ip18(e),ip19(e),ip20(e),ip21(e),ip22(e),ip23(e),ip24(e),ip25(e),ip26(e),ip27(e),ip28(e),ip29(e),ip30(e),ip31(e),ip32(e),ip33(e),ip34(e),ip35(e),ip36(e),ip37(e),ip38(e),ip39(e),ip40(e),ip41(e),ip42(e),ip43(e),ip44(e),ip45(e),ip46(e),ip47(e),ip48(e),ip49(e),ip50(e),ip51(e),ip52(e),ip53(e),ip54(e),ip55(e),ip56(e),ip57(e),ip58(e),ip59(e),ip60(e),ip61(e),ip62(e),ip63(e),ip64(e),ip65(e),ip66(e),ip67(e),ip68(e),ip69(e),ip70(e),ip71(e),ip72(e),ip73(e),ip74(e),ip75(e),ip76(e),ip77(e),ip78(e),ip79(e),ip80(e),ip81(e),ip82(e),ip83(e),ip84(e),ip85(e),ip86(e),ip87(e),ip88(e),ip89(e),ip90(e),ip91(e),ip92(e),ip93(e),ip94(e)]}async function ch0(e){let t=e.config,n=new _j;e.notifier=new GG(e.messageToDart),fo0(n,e);let s=new wj({registry:n,maxLinksPerProvider:t.pan.maxLinksPerProvider,showTranscode:t.pan.showTranscode,showUcUnlimited:t.pan.showUcUnlimited,providerOrder:t.pan.priority});e.panService=s;let c=new Ej(s,{notifier:e.notifier});return e.panAdapter=c,e.embyAccounts=await xm0(e),xh0({registry:n,panService:s,panAdapter:c,credentials:e.credentials,db:e.db,config:t,remoteWexConfig:e.remoteWexConfig,messageToDart:e.messageToDart,embyAccounts:e.embyAccounts})}var dh0=["\u7F8E\u5267","\u97E9\u5267","\u65E5\u5267","\u53F0\u5267","\u6E2F\u5267","\u6E2F\u53F0\u5267","\u56FD\u4EA7\u5267","\u5927\u9646\u5267","\u5185\u5730\u5267","\u6CF0\u5267","\u82F1\u5267","\u7F8E\u5267\u7248","\u82F1\u5267\u7248","\u65E5\u5267\u7248","\u97E9\u5267\u7248","\u53F0\u5267\u7248","\u6E2F\u5267\u7248","\u6CF0\u5267\u7248","\u5F71\u540E","\u5F71\u5E1D","\u56FD\u5267","\u5FAE\u77ED\u5267","\u77ED\u5267","\u7535\u5F71","\u5267\u96C6","\u7EFC\u827A","\u72AF\u7F6A","\u52A8\u6F2B","\u52A8\u753B","\u7EAA\u5F55\u7247","\u77ED\u7247","\u8FDE\u7EED\u5267","\u7CFB\u5217\u5267","\u7F51\u7EDC\u5267","\u7535\u89C6\u5267"],Str=["\u5F71\u7247","\u7247\u5B50","\u7247\u82B1","\u7247\u6BB5","\u9884\u544A","\u9884\u544A\u7247","\u82B1\u7D6E","\u5E55\u540E","\u8BBF\u8C08","\u7279\u522B\u7BC7","\u756A\u5916\u7BC7","OVA","OAD","SP","TV\u7248","\u5267\u573A\u7248","\u7535\u5F71\u7248","\u5F71\u7248","\u5267\u7248","\u56FD\u8BED\u7248","\u666E\u901A\u8BDD\u7248","\u7CA4\u8BED\u7248","\u95FD\u5357\u8BED\u7248","\u5BA2\u5BB6\u8BED\u7248","\u5434\u8BED\u7248","\u5DDD\u8BED\u7248","\u6E58\u8BED\u7248","\u8D63\u8BED\u7248","\u7CA4\u8BED\u914D\u97F3\u7248","\u56FD\u8BED\u914D\u97F3\u7248","\u666E\u901A\u8BDD\u914D\u97F3\u7248","\u65B9\u8A00\u7248","\u539F\u7248\u914D\u97F3","\u539F\u97F3\u7248","\u53F0\u8BED\u7248","\u7CA4\u8BED\u4E2D\u5B57\u7248","\u56FD\u8BED\u4E2D\u5B57\u7248","\u666E\u901A\u8BDD\u4E2D\u5B57\u7248","\u7CA4\u8BED\u539F\u58F0\u7248","\u56FD\u8BED\u539F\u58F0\u7248","\u666E\u901A\u8BDD\u539F\u58F0\u7248","\u7CA4\u8BED\u5185\u5D4C\u5B57\u5E55\u7248","\u56FD\u8BED\u5185\u5D4C\u5B57\u5E55\u7248","\u666E\u901A\u8BDD\u5185\u5D4C\u5B57\u5E55\u7248","\u52A8\u753B\u7248","\u771F\u4EBA\u7248","\u6539\u7F16\u7248","\u91CD\u5236\u7248","\u4FEE\u590D\u7248","\u52A0\u957F\u7248","\u672A\u5220\u51CF\u7248","\u5B8C\u6574\u7248","\u5BFC\u6F14\u526A\u8F91\u7248","\u7EC8\u6781\u7248","\u7279\u522B\u7248","\u9650\u5B9A\u7248","\u6536\u85CF\u7248","\u8C6A\u534E\u7248","\u5178\u85CF\u7248","\u9AD8\u6E05\u7248","\u8D85\u6E05\u7248","\u6807\u6E05\u7248","HD\u7248","UHD\u7248","4K\u7248","\u84DD\u5149\u7248","DVD\u7248","BD\u7248","WEB\u7248","TVrip","BDrip","DVDrip","HDrip","WEB-DL","HDTV","BRRip","HDRip","BluRay","TS","TC","CAM","\u62A2\u5148\u7248","\u67AA\u7248","\u5077\u62CD\u7248","\u6CC4\u9732\u7248","\u62A2\u5148\u770B","\u6B63\u7247","\u6B63\u7247\u7247\u6BB5","\u6B63\u7247\u7CBE\u534E","\u7CBE\u5F69\u7247\u6BB5","\u7CBE\u5F69\u96C6\u9526","\u7CBE\u9009\u7247\u6BB5","\u9AD8\u80FD\u7247\u6BB5","\u9AD8\u5149\u65F6\u523B","\u526A\u8F91\u7248","\u6DF7\u526A","MV","\u4E3B\u9898\u66F2","\u63D2\u66F2","\u7247\u5C3E\u66F2","\u914D\u4E50","\u539F\u58F0","OST","\u539F\u58F0\u5E26","\u97F3\u4E50\u96C6","\u97F3\u4E50\u4F1A","\u6F14\u5531\u4F1A","Live","Live\u7248","\u73B0\u573A\u7248","\u821E\u53F0\u7248","\u821E\u53F0\u5267","\u7EFC\u827A\u79C0","\u771F\u4EBA\u79C0","\u8131\u53E3\u79C0","\u8BBF\u8C08\u8282\u76EE","\u7EAA\u5F55\u7247\u7CFB\u5217","\u4E13\u9898\u7247","\u79D1\u6559\u7247","\u52A8\u753B\u7247","\u52A8\u6F2B\u7247","\u52A8\u753B\u7535\u5F71","\u52A8\u753B\u7CFB\u5217","\u52A8\u753B\u5267\u96C6","\u7535\u5F71\u5408\u96C6","\u7CFB\u5217\u5408\u96C6","\u5408\u96C6\u7248","\u5168\u96C6","\u5168\u7CFB\u5217","\u5168\u5B63","\u7B2C\u4E00\u5B63","\u7B2C\u4E8C\u5B63","\u7B2C\u4E09\u5B63","\u7B2C\u56DB\u5B63","\u7B2C\u4E94\u5B63","\u7B2C\u516D\u5B63","\u7B2C\u4E03\u5B63","\u7B2C\u516B\u5B63","\u7B2C\u4E5D\u5B63","\u7B2C\u5341\u5B63","\u66F4\u65B0\u4E2D","\u5B8C\u7ED3","\u5B8C\u7ED3\u7BC7","\u5B8C\u7ED3\u5B63","\u6700\u7EC8\u5B63","\u6700\u7EC8\u7AE0","\u7EC8\u7AE0","\u7EC8\u7BC7","\u5927\u7ED3\u5C40","\u5168\u5267\u7EC8","BD","BDRIP","WEB-DL","HDRip","DVDRip","BDRip","BRRip","Rip","IMAX","HD","HDR","UHD","4K","1080p","720p","2160p","480p","120fps","60fps","x264","x265","H264","HEVC","AAC","dts","ddp","truehd","10bit","8bit","5\\.1","7\\.1","\u56FD\u8BED","\u7CA4\u8BED","\u82F1\u8BED","\u65E5\u8BED","\u97E9\u8BED","\u6CF0\u8BED","\u6CD5\u8BED","\u5FB7\u8BED","\u4E2D\u5B57","\u7B80\u4E2D","\u7E41\u4E2D","\u7B80\u7E41\u4E2D\u5B57","\u4E2D\u82F1\u53CC\u5B57","\u5185\u5D4C","\u5185\u5C01","\u675C\u6BD4\u5168\u666F\u58F0","\u675C\u6BD4\u97F3\u6548","\u65E0\u6C34\u5370","\u89E3\u8BF4\u7248","\u62A2\u5148","\u4E24\u5B63\u5168","DV","\u538B\u5236","HQ","\u5E27","\u8C46\u74E3","\u66F4\u65B0","\u66F4\u65B0\u5230","\u63A8\u8350","\u52A8\u4F5C","\u5192\u9669","\u7231\u60C5","\u79D1\u5E7B","\u60AC\u7591","\u60CA\u609A","\u6050\u6016","\u559C\u5267","\u5267\u60C5","\u5947\u5E7B","\u6218\u4E89","\u5386\u53F2","\u4F20\u8BB0","\u97F3\u4E50","\u5BB6\u5EAD","\u513F\u7AE5","\u4F53\u80B2","\u707E\u96BE","\u9AD8\u6E05","\u8D85\u6E05","\u6807\u6E05","\u62A2\u9C9C\u770B","\u9996\u64AD","\u72EC\u64AD","\u70ED\u64AD","\u8FDE\u8F7D\u4E2D","\u6700\u65B0","\u7ECF\u5178","\u70ED\u95E8","\u83B7\u5956","\u53E3\u7891","\u597D\u8BC4","\u9AD8\u5206","\u8C46\u74E3\u9AD8\u5206","IMDb\u9AD8\u5206","\u84DD\u5149","\u4FEE\u590D","\u91CD\u5236","\u539F\u753B","\u5408\u96C6","\u5957\u88C5","\u7CFB\u5217","\u756A\u5916","\u7EED\u96C6","\u524D\u4F20","\u540E\u4F20","\u91CD\u542F","\u7FFB\u62CD"],cme=mh0(dh0),ume=mh0([...dh0,...Str]),uh0=new Map("\u96F6\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D".split("").map((e,t)=>[e,t])),Etr=new Map([["\u5341",10],["\u767E",100],["\u5343",1e3],["\u4E07",1e4],["\u4EBF",1e8]]);function fme(e){if(!String(e||"").trim())return"";let t=String(e).trim().replace(/丨/g,"").replace(/-/g," ").replace(cme,"").replace(/\s+/g," ").trim(),n=Ntr(t),s=/^([\u4e00-\u9fa5]+\d+)(?=：|\s|$)/u.exec(t);if(s)return s[1];let c=/^([\u4e00-\u9fa5]+[\u4e00-\u9fa50-9]+)\s*(?=\(\d{4}\))/u.exec(t);if(c)return c[1];let l=/^([\u4e00-\u9fa5]+[\u4e00-\u9fa5 ,.，。、]+)\s*(?=\(|【|\s+\d{4})/u.exec(t)?.[1]?.trim()||"",d=!1,m=/《(.+?)》/u.exec(t);if(m)t=m[1],d=!0;else{let y=/【(.+?)】/u.exec(t);cme.lastIndex=0,y&&!y[1].includes("/")&&!cme.test(y[1])&&(t=y[1],d=!0)}!d&&l&&(t=l),t=t.replace(/-.*/u,"").replace(/\b\d{4}\b/u,"").replace(/\[.*?\]/gu,(y,v)=>v===0?y:" ").replace(/\{.*?\}|（.*?）|「.*?」/gu," ").replace(/\b\d+(?:\.\d+)?[GMK]B?\b/giu,"").replace(ume,"").replace(/豆瓣\d+(?:\.\d+)?/gu,"").replace(/\b\d+(?=fps|帧)/giu,"").replace(/\b[a-zA-Z]\b/gu,"").replace(/\d+/g,(y,v,w)=>{let T=v>0?w[v-1]:"",I=w[v+y.length]||"";return!lh0(T)&&!lh0(I)?"":y}).replace(/[^\u4e00-\u9fa5a-zA-Z0-9 ]/g,"").replace(/\s+/g," ").trim(),t.includes(" ")&&(t=t.slice(0,t.indexOf(" "))),!d&&l&&(t=t.replace(/\s/g,""));let g=/([\u4e00-\u9fa5]{2,})\s*$/u.exec(String(e));if(g&&(t.length<2||/^\d+集$/u.test(t))&&(t=g[1]),!t){let y=/\[(.*?)\]/u.exec(String(e));y&&(t=y[1].replace(ume,"").replace(/\d+/gu,"").replace(/\s+/g," ").trim())}return(!/[\u4e00-\u9fa5]{2,}/u.test(t)||/^\.?[a-z]*gb$/iu.test(t))&&n&&(t=n),t}function _Y(e){if(!String(e||""))return"";let t=String(e),n=t.lastIndexOf(".");n>0&&(t=t.slice(0,n));let s=/^\s*[\[【]\s*0*(\d{1,8})\s*[\]】]/u.exec(t);if(s)return sh(s[1]);let c=Ttr(t);return c||(t=Itr(t),Rtr(t)||Ctr(t)||"")}function Ttr(e){let t=String(e).replace(/(\[|\{|（|【).*?(\]|\}|）|】)/gu," ");if(/s\d+e\d+/iu.test(t))return"";let n=/[\u4e00-\u9fa5\-_.\s]+(0*\d{1,8})(?:[\-_.\s]|$)/u.exec(t);return n&&lme(n[1])?sh(n[1]):(n=/^0*\d{1,8}$/u.exec(t.trim()),n&&lme(n[0])?sh(n[0]):"")}function Itr(e){return String(e).replace(/[（()[\]【】{}]\s*([上中下])\s*[）()[\]【】{}]/gu,"$1").replace(/(\[|\{|（|【).*?(\]|\}|）|】)/gu," ").replace(/\d+\s*(?:fps|帧|frames?|hz|赫兹)/giu," ").replace(/\b(\d+(?:p|k|i)|4k|8k|uhd|hd|fhd|qhd|2160p|1440p|1080p|720p|480p|360p)\b/giu," ").replace(/\b(19|20)\d{2}\b/gu," ").replace(/\b(?:dts|ddp|aac|ac3|eac3|truehd|atmos)\d+(?:\.\d+)?\b/giu," ").replace(/\b\d+\.\d+\b/gu," ").replace(/\b(8bit|10bit|12bit)\b/giu," ").replace(/\b(hdr|hdr10|hdr10\+|dolby vision|dv|hlg)\b/giu," ").replace(/\b(x264|x265|h\.264|h\.265|h264|h265|hevc|mpeg4|av1|vp9)\b/giu," ").replace(/\b(web-dl|bluray|bdrip|hdrip|dvdrip|brrip|hdtv|dvdr|cam|ts|tc|r5|scr)\b/giu," ").replace(/\b(hq|sd|hd|fhd|uhd|imax|superbit|remux|extended|uncut|directors cut|dc|special edition|se)\b/giu," ").replace(/\b(高码|高码率|高码版|超清|高清|标清|无水印|完整版|未删减|加长版|导演剪辑版|特效字幕|内嵌字幕|双语字幕|中文字幕|英文字幕|繁体字幕|简体字幕|多音轨|杜比音效|全景声|hdr)\b/giu," ").replace(/[-_.,()]+/gu," ").replace(/\s+/g," ").trim()}function Rtr(e){let t=/(第?)(0*(\d{1,8}|[零一二三四五六七八九十百千万亿]+))((?:期|季)[上中下]?[（(]?[上中下]?[)）]?)/u.exec(e);if(t)return`${t[1]}${sh(t[2])}${t[4].replace(/[（）()]/gu,"")}`;let n=[...String(e).matchAll(/(?:s\d+.*?e|e)(\d{1,8})(?!\d)/giu)].pop();if(n)return sh(n[1]);if(t=/第([零一二三四五六七八九十百千万亿]+)[集話话]/u.exec(e),t){let s=ph0(t[1]);return s>0?String(s):""}return t=/第(\d{1,8})[集話话]/u.exec(e),t||(t=/ep(\d{1,8})/iu.exec(e),t)||(t=/(\d{1,8})[集話话]/u.exec(e),t)?sh(t[1]):""}function Ctr(e){let t=String(e);for(let n of t.matchAll(/0*(\d{1,8})/g)){let s=n.index>0?t[n.index-1]:"",c=t[n.index+n[0].length]||"";if(!(fh0(s)||fh0(c))&&lme(n[1],!0))return sh(n[1])}return""}function sh(e){return String(e||"").replace(/[零一二三四五六七八九十百千万亿]+|\d+/gu,t=>{if(/^\d+$/u.test(t))return t.replace(/^0+(?!$)/u,"");let n=ph0(t);return n>0?String(n):t})}function ph0(e){if(!e)return-1;let t=0,n=0,s=0;for(let c of String(e)){if(uh0.has(c)){s=s*10+uh0.get(c);continue}let l=Etr.get(c);if(!l)return-1;l>=1e4?(n=(n+s)*l,t+=n,n=0):(s===0&&l>=10&&(s=1),n+=s*l),s=0}return t+=n+s,t>0&&t<=Number.MAX_SAFE_INTEGER?t:-1}function lme(e,t=!1){let n=Number.parseInt(e,10);return!Number.isFinite(n)||!t&&n<=0?!1:!(n>=1900&&n<=2100)}function lh0(e){return/[\u4e00-\u9fa5]/.test(e)}function fh0(e){return/[a-zA-Z0-9]/.test(e)}function Ntr(e){return String(e||"").split(/[.\s]+/u).map(n=>n.replace(/^[\[【][^\]】]*[\]】]/u,"").replace(ume,"").replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/gu,"").trim()).filter(Boolean).find(n=>/[\u4e00-\u9fa5]{2,}/u.test(n))||""}function mh0(e){return new RegExp(e.map(Otr).join("|"),"giu")}function Otr(e){return String(e).replace(/[.*+?^${}()|[\]\\]/g,"\\$&").replace(/\\\\/g,"\\")}var Dtr=800,Ptr=30*1e3;function gh0(e,t,n,s=null){if(e?.autoDanmakuEnabled===!1||!e?.danmuApi||!e?.messageToDart||!Btr(t)||!Ltr(n)||Mtr(n))return;let c=$tr(s,n),l=setTimeout(()=>{dme(e,c).catch(d=>{e.log?.warn?.({error:d},"[Danmaku] auto push failed")})},Dtr);typeof l.unref=="function"&&l.unref()}async function dme(e,t={}){let n=await e.messageToDart({action:"getPlayInfo",opt:{}}),s=n?.title,c=Utr(n?.episodeName,t.episodeName,t.fileName,n?.flag),l=fme(s)||yh0(s),d=_Y(c)||cw(c);if(!l)return e.log?.info?.("[Danmaku] auto skipped: empty title"),!1;let m=`${l}@@${d}`,g=Date.now();if(e.autoDanmakuState||(e.autoDanmakuState={lastKey:"",lastTime:0}),e.autoDanmakuState.lastKey===m&&g-e.autoDanmakuState.lastTime<Ptr)return e.log?.info?.({title:l,episode:d},"[Danmaku] auto skipped: duplicate"),!1;e.autoDanmakuState={lastKey:m,lastTime:g};let y=e.server.address()?.port||9988,v=new URLSearchParams({name:l});d&&v.set("episode",d);let w=`http://127.0.0.1:${y}/danmu/auto?${v.toString()}`;return await e.messageToDart({action:"danmuPush",opt:{url:w}}),e.log?.info?.({title:l,episode:d,url:w},"[Danmaku] auto pushed"),!0}async function bh0(e,t,n=""){let s=fme(t)||yh0(t);if(!s)throw new Error("\u5F39\u5E55\u5267\u540D\u4E0D\u80FD\u4E3A\u7A7A");let c=new URLSearchParams({name:s}),l=_Y(n)||cw(n);l&&c.set("episode",l);let m=(await e.getFongmiCandidates(c)).find(g=>g?.url);if(!m)throw new Error(`\u5F39\u5E55\u5339\u914D\u5931\u8D25\uFF1A${l?`${s} ${l}`:s}`);return e.getCommentXmlFromCandidate(m.url)}function Btr(e){let t=Number(e?.meta?.type||3);return Number.isFinite(t)&&t<10}function Ltr(e){return!e||typeof e!="object"?!1:!!(e.url||e.parse!==void 0&&e.url!==void 0)}function Mtr(e){return!e||typeof e!="object"?!1:hh0(e.nodanmu)||hh0(e.extra?.nodanmu)}function hh0(e){if(e===!0||e===1)return!0;let t=String(e||"").trim().toLowerCase();return t==="true"||t==="1"||t==="yes"||t==="on"}function yh0(e){return String(e||"").replace(/\s+/g," ").trim()}function cw(e){return String(e||"").replace(/\s+/g," ").trim()}function Utr(...e){for(let t of e){let n=cw(t);if(n&&_Y(n))return n}return cw(e.find(t=>cw(t))||"")}function $tr(e,t){let n=e?.body||{},s=xw(n.episodeName,n.name,n.fileName,n.title),c=Ftr(n.id||n.url||n.playUrl),l=xw(t?.episodeName,t?.name,t?.fileName,t?.title);return{episodeName:xw(s,c,l),fileName:xw(c,s,l)}}function xw(...e){for(let t of e){let n=cw(t);if(n)return n}return""}function Ftr(e){let t=Vtr(e);return t?xw(t.name,t.fileName,t.title,Wtr(t.playToken)):""}function Wtr(e){if(!e)return"";try{let t=typeof e=="string"?JSON.parse(e):e;return xw(t?.fileName,t?.name,t?.title)}catch{return""}}function Vtr(e){let t=String(e||"").trim();if(!t)return null;for(let n of jtr(t))try{let s=JSON.parse(Buffer.from(n,"base64").toString("utf8"));if(s&&typeof s=="object")return s}catch{}return null}function jtr(e){let t=String(e||"").trim(),n=Gtr(t);return[...new Set([t,n,t.replace(/-/g,"+").replace(/_/g,"/"),n.replace(/-/g,"+").replace(/_/g,"/")].filter(Boolean))]}function Gtr(e){try{return decodeURIComponent(e)}catch{return String(e||"")}}async function kh0(e){let t={config:e.config,credentials:e.credentials,db:e.db,messageToDart:e.messageToDart,remoteWexConfig:e.remoteWexConfig},n=await ch0(t);e.spiders=n,e.decorate("panService",t.panService),e.decorate("panAdapter",t.panAdapter);for(let l of n)await Ah0(e,l,`/spider/${l.meta.key}/${l.meta.type}`),await Ah0(e,l,`/spider/${l.meta.key}`);let s=await e.db.get("/config/sites/list",[]),c=qtr(s,n);await e.db.set("/config/sites/list",c,{notify:!1})}async function Ah0(e,t,n){await e.register(async s=>{s.post("/init",t.init?.bind(t)||Htr),t.support&&s.post("/support",t.support.bind(t)),t.home&&s.post("/home",t.home.bind(t)),t.homeVod&&s.post("/homeVod",t.homeVod.bind(t)),t.homeVideo&&s.post("/homeVideo",t.homeVideo.bind(t)),t.category&&s.post("/category",t.category.bind(t)),t.detail&&s.post("/detail",t.detail.bind(t)),t.play&&s.post("/play",async(c,l)=>{let d=await t.play.call(t,c,l);return gh0(e,t,d,c),d}),t.search&&s.post("/search",t.search.bind(t)),t.test&&s.get("/test",t.test.bind(t)),t.lrcproxy&&s.get("/lrcproxy/:token",t.lrcproxy.bind(t)),t.proxy&&(s.get("/proxy/:provider/:sessionId",t.proxy.bind(t)),s.get("/proxy/*",t.proxy.bind(t)))},{prefix:n})}async function Htr(){return{}}function qtr(e,t){let n=new Map(t.map(d=>[`nodejs_${d.meta.key}`,d])),s=new Set,c=(d,m={})=>{let g=`nodejs_${d.meta.key}`,y={...m,key:g,name:d.meta.name,type:d.meta.type,enable:m.enable??!0,searchable:m.searchable??d.meta.searchable??1,quickSearch:m.quickSearch??d.meta.quickSearch??1,filterable:m.filterable??d.meta.filterable??1};return d.meta.changeable!==void 0&&(y.changeable=m.changeable??d.meta.changeable),d.meta.style!==void 0&&(y.style=m.style??d.meta.style),y},l=[];for(let d of e.filter(m=>m&&m.key)){let m=n.get(d.key);m&&(s.add(d.key),l.push(c(m,d)))}for(let d of t){let m=`nodejs_${d.meta.key}`;s.has(m)||l.push(c(d))}return l}D7();Pr();Cn();$r();ES();Ga();Pr();$r();Cn();x6();$ye();function ydr(e,t,n=!1){if(t===0&&!n)return e.map(l=>({...l,t:l.t!==void 0?l.t:parseFloat(l.p.split(",")[0])}));let s=e.reduce((l,d)=>{let m=d.t!==void 0?d.t:parseFloat(d.p.split(",")[0]),g=t===0?m.toFixed(2):Math.floor(m/(t*60));return l[g]||(l[g]=[]),l[g].push({...d,t:m}),l},{});return Object.keys(s).map(l=>{let m=s[l].reduce((g,y)=>{let v=y.m.split(" X")[0].trim();if(g[v]||(g[v]={count:0,earliestT:y.t,cid:y.cid,p:y.p,like:0,color_v2:y.color_v2,sources:new Set}),g[v].count+=1,g[v].earliestT=Math.min(g[v].earliestT,y.t),g[v].color_v2===void 0&&y.color_v2!==void 0&&(g[v].color_v2=y.color_v2),g[v].like+=y.like!==void 0?y.like:0,y.p){let w=y.p.match(/\[([^\]]*)\]$/);w&&w[1]&&w[1].split(/[&＆]/).forEach(T=>{T.trim()&&g[v].sources.add(T.trim())})}return g},{});return Object.keys(m).map(g=>{let y=m[g],v=Math.max(1,y.sources.size),w=Math.round(y.count/v);w<1&&(w=1);let T=Array.from(y.sources).join("\uFF06"),I=y.p.replace(/\[([^\]]*)\]$/,`[${T}]`);return{cid:y.cid,p:I,m:w>1?`${g}\u200Ax\u200A${w}`:g,t:y.earliestT,like:y.like,...y.color_v2!==void 0?{color_v2:y.color_v2}:{}}})}).flat().sort((l,d)=>l.t-d.t)}function Adr(e){if(!te.likeSwitch)return e;let t=new Set(["[hanjutv]","[sohu]","[bilibili1]","[migu]"]);return e.map(n=>{if(!n.like||n.like<5)return n;let s=n.p.match(/,(\[[^\]]+\])$/)?.[1]||"",d=s.includes("\u97E9\u5C0F\u5708")||s.includes("\u6781\u901F\u7248")||t.has(s)?100:1e3,m=n.like>=d?"\u{1F525}":"\uFE0F\u2661",g;n.like>=1e4?g=(n.like/1e4).toFixed(1)+"w":n.like>=1e3?g=(n.like/1e3).toFixed(1)+"k":g=n.like.toString();let y=`\u200A${m}${g}`,v=n.m+y,{like:w,...T}=n;return{...T,m:v}})}function kdr(e,t){if(t===0)return e;let n=t*1e3,s=e.length;if(s<=n)return e;let c=s/n,l=[];for(let d=0;d<n;d++){let m=Math.floor(d*c);l.push(e[m])}return l}function Pw0(e){return e.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}function vdr(e){if(!e||typeof e!="string")return[];let t=e.replace(/，/g,","),n=d=>{let m=d+1;for(;m<t.length;){if(t[m]==="\\"){m+=2;continue}if(t[m]==="/"){let y=t.slice(m+1).match(/^([a-z]*)(\s*)(?:,|$)/);if(y)return m+1+y[1].length+y[2].length}m++}return-1},s=[],c="",l=0;for(;l<t.length;){let d=t[l];if(d==="/"){let m=n(l);if(m!==-1){c+=t.slice(l,m),l=m;continue}c+=d,l++;continue}if(d===","){s.push(c),c="",l++;continue}c+=d,l++}return c.trim()!==""&&s.push(c),s.map(d=>d.trim()).filter(d=>d!=="")}function _dr(e){let t=e.match(/^\/([\s\S]+)\/([a-z]*)$/);if(t)try{return new RegExp(t[1],t[2].replace(/[gy]/g,""))}catch(n){return U("warn",`[system] [danmu] \u65E0\u6548\u7684\u5C4F\u853D\u8BCD\u6B63\u5219(\u5DF2\u6309\u5B57\u9762\u91CF\u5904\u7406): ${e}`,n?.message||n),new RegExp(Pw0(e))}return new RegExp(Pw0(e))}function wdr(e,t,n){let s=c=>Math.round((e>>c&255)+((t>>c&255)-(e>>c&255))*n);return s(16)<<16|s(8)<<8|s(0)}var Bw0={bilibili:"16478873,3389695",sweet:"16739211,10639871",cyber:"65415,6352895",sunset:"16754470,16732754",ocean:"3027346,1835007",mint:"4450683,3733975",rainbow:"16711680,16753920,16776960,65280,65535,255,8388863"};function Sdr(e){let t=String(e||"").trim().toLowerCase();return t&&Object.prototype.hasOwnProperty.call(Bw0,t)?Bw0[t]:e}function Edr(e){let t=String(e||"").split(",").map(s=>parseInt(s.trim(),10)).filter(s=>!isNaN(s)&&s>=0&&s<=16777215);if(t.length===0)return null;if(t.length===1)return()=>t[0];let n=t.length-1;return s=>{let c=Math.min(Math.max(s,0),1)*n,l=Math.min(Math.floor(c),n-1);return wdr(t[l],t[l+1],c-l)}}function vP(e,t){let n=[],s=1,c=!1,l=0,d=[];if(typeof e=="string")d=[...e.matchAll(/<d p="([^"]+)">([^<]+)<\/d>/g)].map(L=>({p:L[1],m:L[2]}));else if(e&&Array.isArray(e.danmuku)){let L={right:1,top:4,bottom:5},q=W=>W?parseInt(W.replace("#",""),16):16777215;d=e.danmuku.map(W=>({timepoint:W[0],ct:L[W[1]]!==void 0?L[W[1]]:1,color:q(W[2]),content:W[4]}))}else Array.isArray(e)&&(d=e);if(!d.length)return[];for(let L of d){let q,W,F,J,ee;if("progress"in L&&"mode"in L&&"content"in L)F=(L.progress/1e3).toFixed(2),J=L.mode||1,ee=L.color||16777215,W=L.content;else if("timepoint"in L)F=parseFloat(L.timepoint).toFixed(2),J=L.ct||0,ee=L.color||16777215,W=L.content;else{if(!("p"in L))continue;let ae=L.p.split(",");F=parseFloat(ae[0]).toFixed(2),J=ae[1]||0,ae.length===4?ee=ae[2]||16777215:ae.length>=8?ee=ae[3]||16777215:ee=ae[3]||ae[2]||16777215,W=L.m}let ne=L._sourceLabel||t;L.realTimeSource&&!ne.includes(L.realTimeSource)&&(ne=`${ne}\uFF06${L.realTimeSource}`),!c&&/[&＆]/.test(ne)&&(c=!0),q=[F,J,ee,`[${ne}]`].join(",");let re={p:q,m:W,cid:s++,like:L?.like};L.color_v2&&(re.color_v2=L.color_v2,l++),n.push(re)}l>0&&U("info",`[system] [danmu] [danmu convert] \u900F\u4F20\u4E86 ${l} \u6761\u6E90\u6E10\u53D8\u8272\u5F39\u5E55\uFF08color_v2\uFF09`);let m=te.danmuSimplifiedTraditional==="simplified"?pi:te.danmuSimplifiedTraditional==="traditional"?wl:null;if(m){n=n.map(q=>({...q,m:typeof q.m=="string"?m(q.m):q.m}));let L=te.danmuSimplifiedTraditional==="simplified"?"\u7B80\u4F53\u5B57":"\u7E41\u4F53\u5B57";U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${n.length} \u6761\u5F39\u5E55\u4E3A${L}`)}let y=vdr(te.blockedWords).map(_dr);y.length===0?te.blockedWords&&te.blockedWords.trim()!==""?U("warn",`[system] [danmu] [blocked-words] \u274C \u5DF2\u914D\u7F6E\u5C4F\u853D\u8BCD\u4F46\u672A\u89E3\u6790\u51FA\u6709\u6548\u89C4\u5219\uFF0C\u672C\u6B21\u4E0D\u4F1A\u8FC7\u6EE4\u4EFB\u4F55\u5F39\u5E55\uFF01\u539F\u59CB\u914D\u7F6E: ${JSON.stringify(te.blockedWords)}`):U("info","[system] [danmu] [blocked-words] \u672A\u914D\u7F6E\u5C4F\u853D\u8BCD(BLOCKED_WORDS \u4E3A\u7A7A)\uFF0C\u8DF3\u8FC7\u8FC7\u6EE4"):U("info",`[system] [danmu] [blocked-words] \u89C4\u5219\u89E3\u6790\u6210\u529F: \u5171 ${y.length} \u6761 [ ${y.map(L=>L.toString()).join(" , ")} ]`);let v=new Array(y.length).fill(0),w=[],T=n.filter(L=>{for(let q=0;q<y.length;q++)if(y[q].test(L.m))return v[q]++,w.length<3&&w.push(`\u300C${String(L.m).slice(0,30)}\u300D\u2190 ${y[q].toString()}`),!1;return!0}),I=n.length-T.length;if(y.length>0)if(I>0){let L=y.map((q,W)=>({rule:q.toString(),count:v[W]})).filter(q=>q.count>0).map(q=>`${q.rule} \xD7${q.count}`).join(", ");U("info",`[system] [danmu] [blocked-words] \u2705 \u5C4F\u853D\u8BCD\u5DF2\u751F\u6548: \u62E6\u622A ${I}/${n.length} \u6761\u5F39\u5E55${L?`\uFF0C\u547D\u4E2D\u660E\u7EC6: ${L}`:""}`),w.length&&U("info",`[system] [danmu] [blocked-words] \u62E6\u622A\u793A\u4F8B(\u6700\u591A3\u6761): ${w.join(" | ")}`)}else U("info",`[system] [danmu] [blocked-words] \u26A0\uFE0F \u89C4\u5219\u5DF2\u52A0\u8F7D(${y.length} \u6761)\u4F46\u672C\u96C6\u5F39\u5E55\u65E0\u547D\u4E2D`);U("info",`[system] [danmu] \u53BB\u91CD\u5206\u949F\u6570: ${te.groupMinute}`);let N=ydr(T,te.groupMinute,c),C=Adr(N),B=kdr(C,te.danmuLimit);if(te.convertTopBottomToScroll||te.convertColor==="white"||te.convertColor==="color"){let L=0,q=0,W=0,F=te.convertColor==="color"?Edr(Sdr(te.gradientColors)):null,J=Math.min(Math.max(te.gradientChance||0,0),100)/100;B=B.map(ee=>{let ne=ee.p.split(",");if(ne.length<3)return ee;let re=parseInt(ne[1],10),ae=parseInt(ne[2],10),se=!1;te.convertTopBottomToScroll&&(re===4||re===5)&&(L++,re=1,se=!0),te.convertColor==="white"&&ae!==16777215&&(q++,ae=16777215,se=!0);let be=(typeof te.colorPool=="string"?te.colorPool:"").split(",").map(Je=>parseInt(Je.trim(),10)).filter(Je=>!isNaN(Je)&&Je>=0&&Je<=16777215),ke=be.length>0?be:[16777215],Se=ke[Math.floor(Math.random()*ke.length)];if(te.convertColor==="color"&&ae===16777215&&ee.color_v2===void 0){let Je=Se;if(F&&Math.random()<J){let Ye=parseFloat(ne[0])||0;Je=F(Ye%60/60),W++}ae!==Je&&(q++,ae=Je,se=!0)}if(se){let Je=[ne[0],re,ae,...ne.slice(3)].join(",");return{...ee,p:Je}}return ee}),L>0&&U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${L} \u6761\u9876\u90E8/\u5E95\u90E8\u5F39\u5E55\u4E3A\u6D6E\u52A8\u5F39\u5E55`),q>0&&U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${q} \u6761\u5F39\u5E55\u989C\u8272\uFF08\u5176\u4E2D\u6E10\u53D8\u8272\u5F39\u5E55 ${W} \u6761\uFF09`)}return U("info",`[system] [danmu] danmus_original: ${n.length}`),U("info",`[system] [danmu] danmus_filter: ${T.length}`),U("info",`[system] [danmu] danmus_group: ${N.length}`),U("info",`[system] [danmu] danmus_limit: ${B.length}`),U("info","[system] [danmu] Top 5 danmus:",JSON.stringify(B.slice(0,5),null,2)),B}function g8e(e){return typeof e.r!="number"||e.r<0||e.r>255||typeof e.g!="number"||e.g<0||e.g>255||typeof e.b!="number"||e.b<0||e.b>255?-1:e.r*256*256+e.g*256+e.b}function RS(e){return typeof e!="string"||e.length!==6||!/^[0-9A-Fa-f]{6}$/.test(e)?16777215:parseInt(e,16)}function Tdr(e){let t=`<?xml version="1.0" ?>
+function xh0(e){return[ip0(e)]}async function ch0(e){let t=e.config,n=new _j;e.notifier=new GG(e.messageToDart),fo0(n,e);let s=new wj({registry:n,maxLinksPerProvider:t.pan.maxLinksPerProvider,showTranscode:t.pan.showTranscode,showUcUnlimited:t.pan.showUcUnlimited,providerOrder:t.pan.priority});e.panService=s;let c=new Ej(s,{notifier:e.notifier});return e.panAdapter=c,e.embyAccounts=await xm0(e),xh0({registry:n,panService:s,panAdapter:c,credentials:e.credentials,db:e.db,config:t,remoteWexConfig:e.remoteWexConfig,messageToDart:e.messageToDart,embyAccounts:e.embyAccounts})}var dh0=["\u7F8E\u5267","\u97E9\u5267","\u65E5\u5267","\u53F0\u5267","\u6E2F\u5267","\u6E2F\u53F0\u5267","\u56FD\u4EA7\u5267","\u5927\u9646\u5267","\u5185\u5730\u5267","\u6CF0\u5267","\u82F1\u5267","\u7F8E\u5267\u7248","\u82F1\u5267\u7248","\u65E5\u5267\u7248","\u97E9\u5267\u7248","\u53F0\u5267\u7248","\u6E2F\u5267\u7248","\u6CF0\u5267\u7248","\u5F71\u540E","\u5F71\u5E1D","\u56FD\u5267","\u5FAE\u77ED\u5267","\u77ED\u5267","\u7535\u5F71","\u5267\u96C6","\u7EFC\u827A","\u72AF\u7F6A","\u52A8\u6F2B","\u52A8\u753B","\u7EAA\u5F55\u7247","\u77ED\u7247","\u8FDE\u7EED\u5267","\u7CFB\u5217\u5267","\u7F51\u7EDC\u5267","\u7535\u89C6\u5267"],Str=["\u5F71\u7247","\u7247\u5B50","\u7247\u82B1","\u7247\u6BB5","\u9884\u544A","\u9884\u544A\u7247","\u82B1\u7D6E","\u5E55\u540E","\u8BBF\u8C08","\u7279\u522B\u7BC7","\u756A\u5916\u7BC7","OVA","OAD","SP","TV\u7248","\u5267\u573A\u7248","\u7535\u5F71\u7248","\u5F71\u7248","\u5267\u7248","\u56FD\u8BED\u7248","\u666E\u901A\u8BDD\u7248","\u7CA4\u8BED\u7248","\u95FD\u5357\u8BED\u7248","\u5BA2\u5BB6\u8BED\u7248","\u5434\u8BED\u7248","\u5DDD\u8BED\u7248","\u6E58\u8BED\u7248","\u8D63\u8BED\u7248","\u7CA4\u8BED\u914D\u97F3\u7248","\u56FD\u8BED\u914D\u97F3\u7248","\u666E\u901A\u8BDD\u914D\u97F3\u7248","\u65B9\u8A00\u7248","\u539F\u7248\u914D\u97F3","\u539F\u97F3\u7248","\u53F0\u8BED\u7248","\u7CA4\u8BED\u4E2D\u5B57\u7248","\u56FD\u8BED\u4E2D\u5B57\u7248","\u666E\u901A\u8BDD\u4E2D\u5B57\u7248","\u7CA4\u8BED\u539F\u58F0\u7248","\u56FD\u8BED\u539F\u58F0\u7248","\u666E\u901A\u8BDD\u539F\u58F0\u7248","\u7CA4\u8BED\u5185\u5D4C\u5B57\u5E55\u7248","\u56FD\u8BED\u5185\u5D4C\u5B57\u5E55\u7248","\u666E\u901A\u8BDD\u5185\u5D4C\u5B57\u5E55\u7248","\u52A8\u753B\u7248","\u771F\u4EBA\u7248","\u6539\u7F16\u7248","\u91CD\u5236\u7248","\u4FEE\u590D\u7248","\u52A0\u957F\u7248","\u672A\u5220\u51CF\u7248","\u5B8C\u6574\u7248","\u5BFC\u6F14\u526A\u8F91\u7248","\u7EC8\u6781\u7248","\u7279\u522B\u7248","\u9650\u5B9A\u7248","\u6536\u85CF\u7248","\u8C6A\u534E\u7248","\u5178\u85CF\u7248","\u9AD8\u6E05\u7248","\u8D85\u6E05\u7248","\u6807\u6E05\u7248","HD\u7248","UHD\u7248","4K\u7248","\u84DD\u5149\u7248","DVD\u7248","BD\u7248","WEB\u7248","TVrip","BDrip","DVDrip","HDrip","WEB-DL","HDTV","BRRip","HDRip","BluRay","TS","TC","CAM","\u62A2\u5148\u7248","\u67AA\u7248","\u5077\u62CD\u7248","\u6CC4\u9732\u7248","\u62A2\u5148\u770B","\u6B63\u7247","\u6B63\u7247\u7247\u6BB5","\u6B63\u7247\u7CBE\u534E","\u7CBE\u5F69\u7247\u6BB5","\u7CBE\u5F69\u96C6\u9526","\u7CBE\u9009\u7247\u6BB5","\u9AD8\u80FD\u7247\u6BB5","\u9AD8\u5149\u65F6\u523B","\u526A\u8F91\u7248","\u6DF7\u526A","MV","\u4E3B\u9898\u66F2","\u63D2\u66F2","\u7247\u5C3E\u66F2","\u914D\u4E50","\u539F\u58F0","OST","\u539F\u58F0\u5E26","\u97F3\u4E50\u96C6","\u97F3\u4E50\u4F1A","\u6F14\u5531\u4F1A","Live","Live\u7248","\u73B0\u573A\u7248","\u821E\u53F0\u7248","\u821E\u53F0\u5267","\u7EFC\u827A\u79C0","\u771F\u4EBA\u79C0","\u8131\u53E3\u79C0","\u8BBF\u8C08\u8282\u76EE","\u7EAA\u5F55\u7247\u7CFB\u5217","\u4E13\u9898\u7247","\u79D1\u6559\u7247","\u52A8\u753B\u7247","\u52A8\u6F2B\u7247","\u52A8\u753B\u7535\u5F71","\u52A8\u753B\u7CFB\u5217","\u52A8\u753B\u5267\u96C6","\u7535\u5F71\u5408\u96C6","\u7CFB\u5217\u5408\u96C6","\u5408\u96C6\u7248","\u5168\u96C6","\u5168\u7CFB\u5217","\u5168\u5B63","\u7B2C\u4E00\u5B63","\u7B2C\u4E8C\u5B63","\u7B2C\u4E09\u5B63","\u7B2C\u56DB\u5B63","\u7B2C\u4E94\u5B63","\u7B2C\u516D\u5B63","\u7B2C\u4E03\u5B63","\u7B2C\u516B\u5B63","\u7B2C\u4E5D\u5B63","\u7B2C\u5341\u5B63","\u66F4\u65B0\u4E2D","\u5B8C\u7ED3","\u5B8C\u7ED3\u7BC7","\u5B8C\u7ED3\u5B63","\u6700\u7EC8\u5B63","\u6700\u7EC8\u7AE0","\u7EC8\u7AE0","\u7EC8\u7BC7","\u5927\u7ED3\u5C40","\u5168\u5267\u7EC8","BD","BDRIP","WEB-DL","HDRip","DVDRip","BDRip","BRRip","Rip","IMAX","HD","HDR","UHD","4K","1080p","720p","2160p","480p","120fps","60fps","x264","x265","H264","HEVC","AAC","dts","ddp","truehd","10bit","8bit","5\\.1","7\\.1","\u56FD\u8BED","\u7CA4\u8BED","\u82F1\u8BED","\u65E5\u8BED","\u97E9\u8BED","\u6CF0\u8BED","\u6CD5\u8BED","\u5FB7\u8BED","\u4E2D\u5B57","\u7B80\u4E2D","\u7E41\u4E2D","\u7B80\u7E41\u4E2D\u5B57","\u4E2D\u82F1\u53CC\u5B57","\u5185\u5D4C","\u5185\u5C01","\u675C\u6BD4\u5168\u666F\u58F0","\u675C\u6BD4\u97F3\u6548","\u65E0\u6C34\u5370","\u89E3\u8BF4\u7248","\u62A2\u5148","\u4E24\u5B63\u5168","DV","\u538B\u5236","HQ","\u5E27","\u8C46\u74E3","\u66F4\u65B0","\u66F4\u65B0\u5230","\u63A8\u8350","\u52A8\u4F5C","\u5192\u9669","\u7231\u60C5","\u79D1\u5E7B","\u60AC\u7591","\u60CA\u609A","\u6050\u6016","\u559C\u5267","\u5267\u60C5","\u5947\u5E7B","\u6218\u4E89","\u5386\u53F2","\u4F20\u8BB0","\u97F3\u4E50","\u5BB6\u5EAD","\u513F\u7AE5","\u4F53\u80B2","\u707E\u96BE","\u9AD8\u6E05","\u8D85\u6E05","\u6807\u6E05","\u62A2\u9C9C\u770B","\u9996\u64AD","\u72EC\u64AD","\u70ED\u64AD","\u8FDE\u8F7D\u4E2D","\u6700\u65B0","\u7ECF\u5178","\u70ED\u95E8","\u83B7\u5956","\u53E3\u7891","\u597D\u8BC4","\u9AD8\u5206","\u8C46\u74E3\u9AD8\u5206","IMDb\u9AD8\u5206","\u84DD\u5149","\u4FEE\u590D","\u91CD\u5236","\u539F\u753B","\u5408\u96C6","\u5957\u88C5","\u7CFB\u5217","\u756A\u5916","\u7EED\u96C6","\u524D\u4F20","\u540E\u4F20","\u91CD\u542F","\u7FFB\u62CD"],cme=mh0(dh0),ume=mh0([...dh0,...Str]),uh0=new Map("\u96F6\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D".split("").map((e,t)=>[e,t])),Etr=new Map([["\u5341",10],["\u767E",100],["\u5343",1e3],["\u4E07",1e4],["\u4EBF",1e8]]);function fme(e){if(!String(e||"").trim())return"";let t=String(e).trim().replace(/丨/g,"").replace(/-/g," ").replace(cme,"").replace(/\s+/g," ").trim(),n=Ntr(t),s=/^([\u4e00-\u9fa5]+\d+)(?=：|\s|$)/u.exec(t);if(s)return s[1];let c=/^([\u4e00-\u9fa5]+[\u4e00-\u9fa50-9]+)\s*(?=\(\d{4}\))/u.exec(t);if(c)return c[1];let l=/^([\u4e00-\u9fa5]+[\u4e00-\u9fa5 ,.，。、]+)\s*(?=\(|【|\s+\d{4})/u.exec(t)?.[1]?.trim()||"",d=!1,m=/《(.+?)》/u.exec(t);if(m)t=m[1],d=!0;else{let y=/【(.+?)】/u.exec(t);cme.lastIndex=0,y&&!y[1].includes("/")&&!cme.test(y[1])&&(t=y[1],d=!0)}!d&&l&&(t=l),t=t.replace(/-.*/u,"").replace(/\b\d{4}\b/u,"").replace(/\[.*?\]/gu,(y,v)=>v===0?y:" ").replace(/\{.*?\}|（.*?）|「.*?」/gu," ").replace(/\b\d+(?:\.\d+)?[GMK]B?\b/giu,"").replace(ume,"").replace(/豆瓣\d+(?:\.\d+)?/gu,"").replace(/\b\d+(?=fps|帧)/giu,"").replace(/\b[a-zA-Z]\b/gu,"").replace(/\d+/g,(y,v,w)=>{let T=v>0?w[v-1]:"",I=w[v+y.length]||"";return!lh0(T)&&!lh0(I)?"":y}).replace(/[^\u4e00-\u9fa5a-zA-Z0-9 ]/g,"").replace(/\s+/g," ").trim(),t.includes(" ")&&(t=t.slice(0,t.indexOf(" "))),!d&&l&&(t=t.replace(/\s/g,""));let g=/([\u4e00-\u9fa5]{2,})\s*$/u.exec(String(e));if(g&&(t.length<2||/^\d+集$/u.test(t))&&(t=g[1]),!t){let y=/\[(.*?)\]/u.exec(String(e));y&&(t=y[1].replace(ume,"").replace(/\d+/gu,"").replace(/\s+/g," ").trim())}return(!/[\u4e00-\u9fa5]{2,}/u.test(t)||/^\.?[a-z]*gb$/iu.test(t))&&n&&(t=n),t}function _Y(e){if(!String(e||""))return"";let t=String(e),n=t.lastIndexOf(".");n>0&&(t=t.slice(0,n));let s=/^\s*[\[【]\s*0*(\d{1,8})\s*[\]】]/u.exec(t);if(s)return sh(s[1]);let c=Ttr(t);return c||(t=Itr(t),Rtr(t)||Ctr(t)||"")}function Ttr(e){let t=String(e).replace(/(\[|\{|（|【).*?(\]|\}|）|】)/gu," ");if(/s\d+e\d+/iu.test(t))return"";let n=/[\u4e00-\u9fa5\-_.\s]+(0*\d{1,8})(?:[\-_.\s]|$)/u.exec(t);return n&&lme(n[1])?sh(n[1]):(n=/^0*\d{1,8}$/u.exec(t.trim()),n&&lme(n[0])?sh(n[0]):"")}function Itr(e){return String(e).replace(/[（()[\]【】{}]\s*([上中下])\s*[）()[\]【】{}]/gu,"$1").replace(/(\[|\{|（|【).*?(\]|\}|）|】)/gu," ").replace(/\d+\s*(?:fps|帧|frames?|hz|赫兹)/giu," ").replace(/\b(\d+(?:p|k|i)|4k|8k|uhd|hd|fhd|qhd|2160p|1440p|1080p|720p|480p|360p)\b/giu," ").replace(/\b(19|20)\d{2}\b/gu," ").replace(/\b(?:dts|ddp|aac|ac3|eac3|truehd|atmos)\d+(?:\.\d+)?\b/giu," ").replace(/\b\d+\.\d+\b/gu," ").replace(/\b(8bit|10bit|12bit)\b/giu," ").replace(/\b(hdr|hdr10|hdr10\+|dolby vision|dv|hlg)\b/giu," ").replace(/\b(x264|x265|h\.264|h\.265|h264|h265|hevc|mpeg4|av1|vp9)\b/giu," ").replace(/\b(web-dl|bluray|bdrip|hdrip|dvdrip|brrip|hdtv|dvdr|cam|ts|tc|r5|scr)\b/giu," ").replace(/\b(hq|sd|hd|fhd|uhd|imax|superbit|remux|extended|uncut|directors cut|dc|special edition|se)\b/giu," ").replace(/\b(高码|高码率|高码版|超清|高清|标清|无水印|完整版|未删减|加长版|导演剪辑版|特效字幕|内嵌字幕|双语字幕|中文字幕|英文字幕|繁体字幕|简体字幕|多音轨|杜比音效|全景声|hdr)\b/giu," ").replace(/[-_.,()]+/gu," ").replace(/\s+/g," ").trim()}function Rtr(e){let t=/(第?)(0*(\d{1,8}|[零一二三四五六七八九十百千万亿]+))((?:期|季)[上中下]?[（(]?[上中下]?[)）]?)/u.exec(e);if(t)return`${t[1]}${sh(t[2])}${t[4].replace(/[（）()]/gu,"")}`;let n=[...String(e).matchAll(/(?:s\d+.*?e|e)(\d{1,8})(?!\d)/giu)].pop();if(n)return sh(n[1]);if(t=/第([零一二三四五六七八九十百千万亿]+)[集話话]/u.exec(e),t){let s=ph0(t[1]);return s>0?String(s):""}return t=/第(\d{1,8})[集話话]/u.exec(e),t||(t=/ep(\d{1,8})/iu.exec(e),t)||(t=/(\d{1,8})[集話话]/u.exec(e),t)?sh(t[1]):""}function Ctr(e){let t=String(e);for(let n of t.matchAll(/0*(\d{1,8})/g)){let s=n.index>0?t[n.index-1]:"",c=t[n.index+n[0].length]||"";if(!(fh0(s)||fh0(c))&&lme(n[1],!0))return sh(n[1])}return""}function sh(e){return String(e||"").replace(/[零一二三四五六七八九十百千万亿]+|\d+/gu,t=>{if(/^\d+$/u.test(t))return t.replace(/^0+(?!$)/u,"");let n=ph0(t);return n>0?String(n):t})}function ph0(e){if(!e)return-1;let t=0,n=0,s=0;for(let c of String(e)){if(uh0.has(c)){s=s*10+uh0.get(c);continue}let l=Etr.get(c);if(!l)return-1;l>=1e4?(n=(n+s)*l,t+=n,n=0):(s===0&&l>=10&&(s=1),n+=s*l),s=0}return t+=n+s,t>0&&t<=Number.MAX_SAFE_INTEGER?t:-1}function lme(e,t=!1){let n=Number.parseInt(e,10);return!Number.isFinite(n)||!t&&n<=0?!1:!(n>=1900&&n<=2100)}function lh0(e){return/[\u4e00-\u9fa5]/.test(e)}function fh0(e){return/[a-zA-Z0-9]/.test(e)}function Ntr(e){return String(e||"").split(/[.\s]+/u).map(n=>n.replace(/^[\[【][^\]】]*[\]】]/u,"").replace(ume,"").replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/gu,"").trim()).filter(Boolean).find(n=>/[\u4e00-\u9fa5]{2,}/u.test(n))||""}function mh0(e){return new RegExp(e.map(Otr).join("|"),"giu")}function Otr(e){return String(e).replace(/[.*+?^${}()|[\]\\]/g,"\\$&").replace(/\\\\/g,"\\")}var Dtr=800,Ptr=30*1e3;function gh0(e,t,n,s=null){if(e?.autoDanmakuEnabled===!1||!e?.danmuApi||!e?.messageToDart||!Btr(t)||!Ltr(n)||Mtr(n))return;let c=$tr(s,n),l=setTimeout(()=>{dme(e,c).catch(d=>{e.log?.warn?.({error:d},"[Danmaku] auto push failed")})},Dtr);typeof l.unref=="function"&&l.unref()}async function dme(e,t={}){let n=await e.messageToDart({action:"getPlayInfo",opt:{}}),s=n?.title,c=Utr(n?.episodeName,t.episodeName,t.fileName,n?.flag),l=fme(s)||yh0(s),d=_Y(c)||cw(c);if(!l)return e.log?.info?.("[Danmaku] auto skipped: empty title"),!1;let m=`${l}@@${d}`,g=Date.now();if(e.autoDanmakuState||(e.autoDanmakuState={lastKey:"",lastTime:0}),e.autoDanmakuState.lastKey===m&&g-e.autoDanmakuState.lastTime<Ptr)return e.log?.info?.({title:l,episode:d},"[Danmaku] auto skipped: duplicate"),!1;e.autoDanmakuState={lastKey:m,lastTime:g};let y=e.server.address()?.port||9988,v=new URLSearchParams({name:l});d&&v.set("episode",d);let w=`http://127.0.0.1:${y}/danmu/auto?${v.toString()}`;return await e.messageToDart({action:"danmuPush",opt:{url:w}}),e.log?.info?.({title:l,episode:d,url:w},"[Danmaku] auto pushed"),!0}async function bh0(e,t,n=""){let s=fme(t)||yh0(t);if(!s)throw new Error("\u5F39\u5E55\u5267\u540D\u4E0D\u80FD\u4E3A\u7A7A");let c=new URLSearchParams({name:s}),l=_Y(n)||cw(n);l&&c.set("episode",l);let m=(await e.getFongmiCandidates(c)).find(g=>g?.url);if(!m)throw new Error(`\u5F39\u5E55\u5339\u914D\u5931\u8D25\uFF1A${l?`${s} ${l}`:s}`);return e.getCommentXmlFromCandidate(m.url)}function Btr(e){let t=Number(e?.meta?.type||3);return Number.isFinite(t)&&t<10}function Ltr(e){return!e||typeof e!="object"?!1:!!(e.url||e.parse!==void 0&&e.url!==void 0)}function Mtr(e){return!e||typeof e!="object"?!1:hh0(e.nodanmu)||hh0(e.extra?.nodanmu)}function hh0(e){if(e===!0||e===1)return!0;let t=String(e||"").trim().toLowerCase();return t==="true"||t==="1"||t==="yes"||t==="on"}function yh0(e){return String(e||"").replace(/\s+/g," ").trim()}function cw(e){return String(e||"").replace(/\s+/g," ").trim()}function Utr(...e){for(let t of e){let n=cw(t);if(n&&_Y(n))return n}return cw(e.find(t=>cw(t))||"")}function $tr(e,t){let n=e?.body||{},s=xw(n.episodeName,n.name,n.fileName,n.title),c=Ftr(n.id||n.url||n.playUrl),l=xw(t?.episodeName,t?.name,t?.fileName,t?.title);return{episodeName:xw(s,c,l),fileName:xw(c,s,l)}}function xw(...e){for(let t of e){let n=cw(t);if(n)return n}return""}function Ftr(e){let t=Vtr(e);return t?xw(t.name,t.fileName,t.title,Wtr(t.playToken)):""}function Wtr(e){if(!e)return"";try{let t=typeof e=="string"?JSON.parse(e):e;return xw(t?.fileName,t?.name,t?.title)}catch{return""}}function Vtr(e){let t=String(e||"").trim();if(!t)return null;for(let n of jtr(t))try{let s=JSON.parse(Buffer.from(n,"base64").toString("utf8"));if(s&&typeof s=="object")return s}catch{}return null}function jtr(e){let t=String(e||"").trim(),n=Gtr(t);return[...new Set([t,n,t.replace(/-/g,"+").replace(/_/g,"/"),n.replace(/-/g,"+").replace(/_/g,"/")].filter(Boolean))]}function Gtr(e){try{return decodeURIComponent(e)}catch{return String(e||"")}}async function kh0(e){let t={config:e.config,credentials:e.credentials,db:e.db,messageToDart:e.messageToDart,remoteWexConfig:e.remoteWexConfig},n=await ch0(t);e.spiders=n,e.decorate("panService",t.panService),e.decorate("panAdapter",t.panAdapter);for(let l of n)await Ah0(e,l,`/spider/${l.meta.key}/${l.meta.type}`),await Ah0(e,l,`/spider/${l.meta.key}`);let s=await e.db.get("/config/sites/list",[]),c=qtr(s,n);await e.db.set("/config/sites/list",c,{notify:!1})}async function Ah0(e,t,n){await e.register(async s=>{s.post("/init",t.init?.bind(t)||Htr),t.support&&s.post("/support",t.support.bind(t)),t.home&&s.post("/home",t.home.bind(t)),t.homeVod&&s.post("/homeVod",t.homeVod.bind(t)),t.homeVideo&&s.post("/homeVideo",t.homeVideo.bind(t)),t.category&&s.post("/category",t.category.bind(t)),t.detail&&s.post("/detail",t.detail.bind(t)),t.play&&s.post("/play",async(c,l)=>{let d=await t.play.call(t,c,l);return gh0(e,t,d,c),d}),t.search&&s.post("/search",t.search.bind(t)),t.test&&s.get("/test",t.test.bind(t)),t.lrcproxy&&s.get("/lrcproxy/:token",t.lrcproxy.bind(t)),t.proxy&&(s.get("/proxy/:provider/:sessionId",t.proxy.bind(t)),s.get("/proxy/*",t.proxy.bind(t)))},{prefix:n})}async function Htr(){return{}}function qtr(e,t){let n=new Map(t.map(d=>[`nodejs_${d.meta.key}`,d])),s=new Set,c=(d,m={})=>{let g=`nodejs_${d.meta.key}`,y={...m,key:g,name:d.meta.name,type:d.meta.type,enable:m.enable??!0,searchable:m.searchable??d.meta.searchable??1,quickSearch:m.quickSearch??d.meta.quickSearch??1,filterable:m.filterable??d.meta.filterable??1};return d.meta.changeable!==void 0&&(y.changeable=m.changeable??d.meta.changeable),d.meta.style!==void 0&&(y.style=m.style??d.meta.style),y},l=[];for(let d of e.filter(m=>m&&m.key)){let m=n.get(d.key);m&&(s.add(d.key),l.push(c(m,d)))}for(let d of t){let m=`nodejs_${d.meta.key}`;s.has(m)||l.push(c(d))}return l}D7();Pr();Cn();$r();ES();Ga();Pr();$r();Cn();x6();$ye();function ydr(e,t,n=!1){if(t===0&&!n)return e.map(l=>({...l,t:l.t!==void 0?l.t:parseFloat(l.p.split(",")[0])}));let s=e.reduce((l,d)=>{let m=d.t!==void 0?d.t:parseFloat(d.p.split(",")[0]),g=t===0?m.toFixed(2):Math.floor(m/(t*60));return l[g]||(l[g]=[]),l[g].push({...d,t:m}),l},{});return Object.keys(s).map(l=>{let m=s[l].reduce((g,y)=>{let v=y.m.split(" X")[0].trim();if(g[v]||(g[v]={count:0,earliestT:y.t,cid:y.cid,p:y.p,like:0,color_v2:y.color_v2,sources:new Set}),g[v].count+=1,g[v].earliestT=Math.min(g[v].earliestT,y.t),g[v].color_v2===void 0&&y.color_v2!==void 0&&(g[v].color_v2=y.color_v2),g[v].like+=y.like!==void 0?y.like:0,y.p){let w=y.p.match(/\[([^\]]*)\]$/);w&&w[1]&&w[1].split(/[&＆]/).forEach(T=>{T.trim()&&g[v].sources.add(T.trim())})}return g},{});return Object.keys(m).map(g=>{let y=m[g],v=Math.max(1,y.sources.size),w=Math.round(y.count/v);w<1&&(w=1);let T=Array.from(y.sources).join("\uFF06"),I=y.p.replace(/\[([^\]]*)\]$/,`[${T}]`);return{cid:y.cid,p:I,m:w>1?`${g}\u200Ax\u200A${w}`:g,t:y.earliestT,like:y.like,...y.color_v2!==void 0?{color_v2:y.color_v2}:{}}})}).flat().sort((l,d)=>l.t-d.t)}function Adr(e){if(!te.likeSwitch)return e;let t=new Set(["[hanjutv]","[sohu]","[bilibili1]","[migu]"]);return e.map(n=>{if(!n.like||n.like<5)return n;let s=n.p.match(/,(\[[^\]]+\])$/)?.[1]||"",d=s.includes("\u97E9\u5C0F\u5708")||s.includes("\u6781\u901F\u7248")||t.has(s)?100:1e3,m=n.like>=d?"\u{1F525}":"\uFE0F\u2661",g;n.like>=1e4?g=(n.like/1e4).toFixed(1)+"w":n.like>=1e3?g=(n.like/1e3).toFixed(1)+"k":g=n.like.toString();let y=`\u200A${m}${g}`,v=n.m+y,{like:w,...T}=n;return{...T,m:v}})}function kdr(e,t){if(t===0)return e;let n=t*1e3,s=e.length;if(s<=n)return e;let c=s/n,l=[];for(let d=0;d<n;d++){let m=Math.floor(d*c);l.push(e[m])}return l}function Pw0(e){return e.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}function vdr(e){if(!e||typeof e!="string")return[];let t=e.replace(/，/g,","),n=d=>{let m=d+1;for(;m<t.length;){if(t[m]==="\\"){m+=2;continue}if(t[m]==="/"){let y=t.slice(m+1).match(/^([a-z]*)(\s*)(?:,|$)/);if(y)return m+1+y[1].length+y[2].length}m++}return-1},s=[],c="",l=0;for(;l<t.length;){let d=t[l];if(d==="/"){let m=n(l);if(m!==-1){c+=t.slice(l,m),l=m;continue}c+=d,l++;continue}if(d===","){s.push(c),c="",l++;continue}c+=d,l++}return c.trim()!==""&&s.push(c),s.map(d=>d.trim()).filter(d=>d!=="")}function _dr(e){let t=e.match(/^\/([\s\S]+)\/([a-z]*)$/);if(t)try{return new RegExp(t[1],t[2].replace(/[gy]/g,""))}catch(n){return U("warn",`[system] [danmu] \u65E0\u6548\u7684\u5C4F\u853D\u8BCD\u6B63\u5219(\u5DF2\u6309\u5B57\u9762\u91CF\u5904\u7406): ${e}`,n?.message||n),new RegExp(Pw0(e))}return new RegExp(Pw0(e))}function wdr(e,t,n){let s=c=>Math.round((e>>c&255)+((t>>c&255)-(e>>c&255))*n);return s(16)<<16|s(8)<<8|s(0)}var Bw0={bilibili:"16478873,3389695",sweet:"16739211,10639871",cyber:"65415,6352895",sunset:"16754470,16732754",ocean:"3027346,1835007",mint:"4450683,3733975",rainbow:"16711680,16753920,16776960,65280,65535,255,8388863"};function Sdr(e){let t=String(e||"").trim().toLowerCase();return t&&Object.prototype.hasOwnProperty.call(Bw0,t)?Bw0[t]:e}function Edr(e){let t=String(e||"").split(",").map(s=>parseInt(s.trim(),10)).filter(s=>!isNaN(s)&&s>=0&&s<=16777215);if(t.length===0)return null;if(t.length===1)return()=>t[0];let n=t.length-1;return s=>{let c=Math.min(Math.max(s,0),1)*n,l=Math.min(Math.floor(c),n-1);return wdr(t[l],t[l+1],c-l)}}function vP(e,t){let n=[],s=1,c=!1,l=0,d=[];if(typeof e=="string")d=[...e.matchAll(/<d p="([^"]+)">([^<]+)<\/d>/g)].map(L=>({p:L[1],m:L[2]}));else if(e&&Array.isArray(e.danmuku)){let L={right:1,top:4,bottom:5},q=W=>W?parseInt(W.replace("#",""),16):16777215;d=e.danmuku.map(W=>({timepoint:W[0],ct:L[W[1]]!==void 0?L[W[1]]:1,color:q(W[2]),content:W[4]}))}else Array.isArray(e)&&(d=e);if(!d.length)return[];for(let L of d){let q,W,F,J,ee;if("progress"in L&&"mode"in L&&"content"in L)F=(L.progress/1e3).toFixed(2),J=L.mode||1,ee=L.color||16777215,W=L.content;else if("timepoint"in L)F=parseFloat(L.timepoint).toFixed(2),J=L.ct||0,ee=L.color||16777215,W=L.content;else{if(!("p"in L))continue;let ae=L.p.split(",");F=parseFloat(ae[0]).toFixed(2),J=ae[1]||0,ae.length===4?ee=ae[2]||16777215:ae.length>=8?ee=ae[3]||16777215:ee=ae[3]||ae[2]||16777215,W=L.m}let ne=L._sourceLabel||t;L.realTimeSource&&!ne.includes(L.realTimeSource)&&(ne=`${ne}\uFF06${L.realTimeSource}`),!c&&/[&＆]/.test(ne)&&(c=!0),q=[F,J,ee,`[${ne}]`].join(",");let re={p:q,m:W,cid:s++,like:L?.like};L.color_v2&&(re.color_v2=L.color_v2,l++),n.push(re)}l>0&&U("info",`[system] [danmu] [danmu convert] \u900F\u4F20\u4E86 ${l} \u6761\u6E90\u6E10\u53D8\u8272\u5F39\u5E55\uFF08color_v2\uFF09`);let m=te.danmuSimplifiedTraditional==="simplified"?pi:te.danmuSimplifiedTraditional==="traditional"?wl:null;if(m){n=n.map(q=>({...q,m:typeof q.m=="string"?m(q.m):q.m}));let L=te.danmuSimplifiedTraditional==="simplified"?"\u7B80\u4F53\u5B57":"\u7E41\u4F53\u5B57";U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${n.length} \u6761\u5F39\u5E55\u4E3A${L}`)}let y=vdr(te.blockedWords).map(_dr);y.length===0?te.blockedWords&&te.blockedWords.trim()!==""?U("warn",`[system] [danmu] [blocked-words] \u274C \u5DF2\u914D\u7F6E\u5C4F\u853D\u8BCD\u4F46\u672A\u89E3\u6790\u51FA\u6709\u6548\u89C4\u5219\uFF0C\u672C\u6B21\u4E0D\u4F1A\u8FC7\u6EE4\u4EFB\u4F55\u5F39\u5E55\uFF01\u539F\u59CB\u914D\u7F6E: ${JSON.stringify(te.blockedWords)}`):U("info","[system] [danmu] [blocked-words] \u672A\u914D\u7F6E\u5C4F\u853D\u8BCD(BLOCKED_WORDS \u4E3A\u7A7A)\uFF0C\u8DF3\u8FC7\u8FC7\u6EE4"):U("info",`[system] [danmu] [blocked-words] \u89C4\u5219\u89E3\u6790\u6210\u529F: \u5171 ${y.length} \u6761 [ ${y.map(L=>L.toString()).join(" , ")} ]`);let v=new Array(y.length).fill(0),w=[],T=n.filter(L=>{for(let q=0;q<y.length;q++)if(y[q].test(L.m))return v[q]++,w.length<3&&w.push(`\u300C${String(L.m).slice(0,30)}\u300D\u2190 ${y[q].toString()}`),!1;return!0}),I=n.length-T.length;if(y.length>0)if(I>0){let L=y.map((q,W)=>({rule:q.toString(),count:v[W]})).filter(q=>q.count>0).map(q=>`${q.rule} \xD7${q.count}`).join(", ");U("info",`[system] [danmu] [blocked-words] \u2705 \u5C4F\u853D\u8BCD\u5DF2\u751F\u6548: \u62E6\u622A ${I}/${n.length} \u6761\u5F39\u5E55${L?`\uFF0C\u547D\u4E2D\u660E\u7EC6: ${L}`:""}`),w.length&&U("info",`[system] [danmu] [blocked-words] \u62E6\u622A\u793A\u4F8B(\u6700\u591A3\u6761): ${w.join(" | ")}`)}else U("info",`[system] [danmu] [blocked-words] \u26A0\uFE0F \u89C4\u5219\u5DF2\u52A0\u8F7D(${y.length} \u6761)\u4F46\u672C\u96C6\u5F39\u5E55\u65E0\u547D\u4E2D`);U("info",`[system] [danmu] \u53BB\u91CD\u5206\u949F\u6570: ${te.groupMinute}`);let N=ydr(T,te.groupMinute,c),C=Adr(N),B=kdr(C,te.danmuLimit);if(te.convertTopBottomToScroll||te.convertColor==="white"||te.convertColor==="color"){let L=0,q=0,W=0,F=te.convertColor==="color"?Edr(Sdr(te.gradientColors)):null,J=Math.min(Math.max(te.gradientChance||0,0),100)/100;B=B.map(ee=>{let ne=ee.p.split(",");if(ne.length<3)return ee;let re=parseInt(ne[1],10),ae=parseInt(ne[2],10),se=!1;te.convertTopBottomToScroll&&(re===4||re===5)&&(L++,re=1,se=!0),te.convertColor==="white"&&ae!==16777215&&(q++,ae=16777215,se=!0);let be=(typeof te.colorPool=="string"?te.colorPool:"").split(",").map(Je=>parseInt(Je.trim(),10)).filter(Je=>!isNaN(Je)&&Je>=0&&Je<=16777215),ke=be.length>0?be:[16777215],Se=ke[Math.floor(Math.random()*ke.length)];if(te.convertColor==="color"&&ae===16777215&&ee.color_v2===void 0){let Je=Se;if(F&&Math.random()<J){let Ye=parseFloat(ne[0])||0;Je=F(Ye%60/60),W++}ae!==Je&&(q++,ae=Je,se=!0)}if(se){let Je=[ne[0],re,ae,...ne.slice(3)].join(",");return{...ee,p:Je}}return ee}),L>0&&U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${L} \u6761\u9876\u90E8/\u5E95\u90E8\u5F39\u5E55\u4E3A\u6D6E\u52A8\u5F39\u5E55`),q>0&&U("info",`[system] [danmu] [danmu convert] \u8F6C\u6362\u4E86 ${q} \u6761\u5F39\u5E55\u989C\u8272\uFF08\u5176\u4E2D\u6E10\u53D8\u8272\u5F39\u5E55 ${W} \u6761\uFF09`)}return U("info",`[system] [danmu] danmus_original: ${n.length}`),U("info",`[system] [danmu] danmus_filter: ${T.length}`),U("info",`[system] [danmu] danmus_group: ${N.length}`),U("info",`[system] [danmu] danmus_limit: ${B.length}`),U("info","[system] [danmu] Top 5 danmus:",JSON.stringify(B.slice(0,5),null,2)),B}function g8e(e){return typeof e.r!="number"||e.r<0||e.r>255||typeof e.g!="number"||e.g<0||e.g>255||typeof e.b!="number"||e.b<0||e.b>255?-1:e.r*256*256+e.g*256+e.b}function RS(e){return typeof e!="string"||e.length!==6||!/^[0-9A-Fa-f]{6}$/.test(e)?16777215:parseInt(e,16)}function Tdr(e){let t=`<?xml version="1.0" ?>
 `;t+=`<i>
 `;let n=e.comments||[];if(Array.isArray(n))for(let s of n){let c=Rdr(s);t+='    <d p="'+Cdr(c)+'">'+Ndr(s.m)+`</d>
 `}return t+="</i>",t}function Idr(){let t=(Date.now()%1e8).toString().padStart(8,"0"),n=Math.floor(Math.random()*1e3).toString().padStart(3,"0");return t+n}function Rdr(e){let t=e.p.split(","),s=(parseFloat(t[0])||0).toFixed(1),c=t[1]||"1",l="25",d=t[2]||"16777215",m="1751533608",g="0",y="0",v=Idr();return`${s},${c},${l},${d},${m},${g},${y},${v}`}function Cdr(e){return e?String(e).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;"):""}function Ndr(e){return e?String(e).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"):""}function Ih(e,t){let n=t||te.danmuOutputFormat;if(n=n.toLowerCase(),U("info",`[system] [danmu] [format] Using format: ${n}`),n==="xml")try{let c=Tdr(e);return N5e(c)}catch(c){return U("error",`[system] [danmu] Failed to convert to XML: ${c.message}`),T0(e)}else if(n==="json")return T0(e);let s=fk0(e,n);return s?.type==="json"?T0(s.data):s?.type==="xml"?N5e(s.data):s?.type==="binary"?T_0(s.data,s.filename):T0(e)}Cn();var Rh=class{constructor({apiKey:t,baseURL:n="https://api.openai.com/v1",model:s="gpt-4o",systemPrompt:c=""}){this.apiKey=t,this.baseURL=n.replace(/\/$/,""),this.model=s,this.systemPrompt=c}async chat(t,n={}){let s={model:n.model||this.model,messages:t,temperature:n.temperature??0,max_tokens:n.maxTokens??8192,stream:!1},c=await Ci(`${this.baseURL}/chat/completions`,JSON.stringify(s),{headers:{"Content-Type":"application/json",Authorization:`Bearer ${this.apiKey}`},timeout:6e4}),l=c.data;if(l?.error){let d=l.error.message;throw new Error(`AI API error ${c.status}: ${d}`)}return l.choices[0].message.content}async ask(t,n={}){let s=[];return this.systemPrompt&&s.push({role:"system",content:this.systemPrompt}),s.push({role:"user",content:t}),this.chat(s,n)}session(t={}){let n=[],s=this.chat.bind(this),c=this.systemPrompt;return c&&n.push({role:"system",content:c}),{async send(l){n.push({role:"user",content:l});let d=await s(n,t);return n.push({role:"assistant",content:d}),d},clear(){n.length=0,c&&n.push({role:"system",content:c})},getHistory(){return[...n]}}}async verify(){try{return{ok:!0,reply:await this.ask("hi",{maxTokens:1})}}catch(t){return{ok:!1,error:t.message}}}};Pr();Cn();$r();x6();ES();EL();Ga();lP();zye();Yye();Xi();Pr();$r();Cn();x6();var Tu=C0(require("fs"),1),TX=C0(require("path"),1);D7();Pr();$r();Xi();x6();var Mo=null,SX=0,a4=!1,XG0=0,fE="0.00",TL=!1,ub=new Map,CIe=null,zG0="custom",YG0=null,QG0=null,lE=null,EX=TX.default.join(process.cwd(),".cache"),eH0="bangumi-data-cache.json",n7r=2e4,p8=new Map,ZG0={custom:["https://cdn.jsdelivr.net/npm/@wan0ge/bangumi-data@0.3/dist/data.json","https://unpkg.com/@wan0ge/bangumi-data@0.3/dist/data.json"],official:["https://cdn.jsdelivr.net/npm/bangumi-data@0.3/dist/data.json","https://unpkg.com/bangumi-data@0.3/dist/data.json"]},i7r="@wan0ge/bangumi-data",a7r="bangumi-data",o7r=/(?:普通[话話]|[国國][语語]|中文配音|中配|中文|[粤粵][语語]配音|[粤粵]配|[粤粵][语語]|[台臺]配|[台臺][语語]|港配|港[语語]|字幕|助[听聽]|日[语語]|日配|原版|原[声聲])(?:版)?/,tH0=/(?:\s+|^)(?:第?\s*(?:\d+|[一二三四五六七八九十]+)\s*[季期部]|season\s*\d+|s\d+|part\s*\d+|act\s*\d+|phase\s*\d+|the\s+final\s+season|(?:movie|film|ova|oad|sp|剧场版|劇場版|续[篇集]|外传)(?![a-z]))|[:：~～]|\s+.*?篇|(?<=\s|^)\d+$/gi,s7r=/\s+/g,x7r=/[,，]/,c7r=/[:：]/;function OIe(e){let t=new Map,n=e.length;for(let s=0;s<n;s++){let c=e[s]._flatText;if(!c)continue;let l=new Set(c);for(let d of l){if(d.trim()==="")continue;let m=t.get(d);m||(m=[],t.set(d,m)),m.push(s)}}ub=t}function KG0(e){if(!e||typeof e!="string")return null;let t=e.match(/^(\d+)\.(\d+)\.(\d+)$/);return t?{major:parseInt(t[1],10),minor:parseInt(t[2],10),patch:parseInt(t[3],10)}:null}function u7r(e,t){let n=KG0(e),s=KG0(t);if(!n||!s)return 0;if(n.major!==s.major)return n.major-s.major;if(n.minor!==s.minor)return n.minor-s.minor;let c=n.patch>=1e3?Math.floor(n.patch/100):n.patch,l=s.patch>=1e3?Math.floor(s.patch/100):s.patch;return c!==l?c-l:0}async function JG0(e){try{let t=`https://cdn.jsdelivr.net/npm/${encodeURIComponent(e)}@0.3/dist/data.json`;U("info",`[system] [\u8BF7\u6C42\u6A21\u62DF] HTTP HEAD: ${t}`);let n=await O7(t,{method:"HEAD",headers:{Accept:"*/*"},signal:AbortSignal.timeout(8e3)});return n.ok&&n.headers.get("x-jsd-version")||null}catch(t){return U("warn",`[system] [Bangumi-Data] \u67E5\u8BE2 ${e} \u7248\u672C\u53F7\u5931\u8D25: ${t.message}`),null}}async function l7r(){return lE||(lE=(async()=>{try{let[e,t]=await Promise.all([YG0||JG0(i7r),QG0||JG0(a7r)]);if(e&&(YG0=e),t&&(QG0=t),!e||!t)return U("info",`[system] [Bangumi-Data] \u7248\u672C\u68C0\u6D4B\u4E0D\u5B8C\u6574 (custom=${e}, official=${t})\uFF0C\u9ED8\u8BA4\u4F7F\u7528\u81EA\u5B9A\u4E49\u6E90`),"custom";let s=u7r(e,t)>=0?"custom":"official";return U("info",`[system] [Bangumi-Data] \u7248\u672C\u5BF9\u6BD4: @wan0ge/bangumi-data@${e} vs bangumi-data@${t} => \u4F7F\u7528${s==="custom"?"\u81EA\u5B9A\u4E49":"\u5B98\u65B9"}\u6E90`),s}catch(e){return U("warn",`[system] [Bangumi-Data] \u6570\u636E\u6E90\u9009\u62E9\u5F02\u5E38\uFF0C\u56DE\u9000\u5230\u81EA\u5B9A\u4E49\u6E90: ${e.message}`),"custom"}})(),lE.finally(()=>{lE=null}),lE)}async function f7r(e=te.deployPlatform){te.useBangumiData&&await RX(e,!0)}function IX(e=te.deployPlatform){te.useBangumiData?RX(e,!0).catch(console.error):DIe(!0)}function NIe(e){return a4=!0,XG0=Date.now(),CIe=p7r(e).finally(()=>{a4=!1,CIe=null}),CIe}async function RX(e,t=!1){if(!te.useBangumiData)return;let n=null,s=te.bangumiDataCacheDays!==void 0?te.bangumiDataCacheDays:7,c=s*24*60*60*1e3;if(e==="node"?Tu.default.existsSync(EX)?n=TX.default.join(EX,eH0):TL||(U("warn","[system] [Bangumi-Data] \u672A\u68C0\u6D4B\u5230\u6839\u76EE\u5F55\u7684 .cache \u6587\u4EF6\u5939\uFF01"),U("warn","[system] [Bangumi-Data] \u6309\u7167\u9879\u76EE\u89C4\u8303\uFF0C\u8BF7\u624B\u52A8\u6302\u8F7D\u6216\u521B\u5EFA .cache \u76EE\u5F55\u4EE5\u542F\u7528\u6301\u4E45\u5316\u3002"),U("warn","[system] [Bangumi-Data] \u672C\u6B21\u8FD0\u884C\u5DF2\u9000\u5316\u4E3A\u7EAF\u5185\u5B58\u6A21\u5F0F (\u91CD\u542F\u540E\u9700\u91CD\u65B0\u4E0B\u8F7D)\u3002"),TL=!0):TL||(U("info",`[system] [Bangumi-Data] \u68C0\u6D4B\u5230 ${e} \u4E91\u73AF\u5883\uFF0C\u5F53\u524D\u8FD0\u884C\u4E8E\u7EAF\u5185\u5B58\u52A0\u901F\u6A21\u5F0F\u3002`),TL=!0),a4&&Date.now()-XG0>n7r&&(U("warn","[system] [Bangumi-Data] \u68C0\u6D4B\u5230\u4E0B\u8F7D\u72B6\u6001\u9501\u6B7B (\u7531\u4E8E Serverless \u8FDB\u7A0B\u4F11\u7720/\u5F3A\u6740\u5BFC\u81F4)\uFF0C\u5F3A\u5236\u91CA\u653E\u9501..."),a4=!1),Mo){if(s>0&&Date.now()-SX<c)return;t&&!a4&&(U("info",`[system] [Bangumi-Data] \u5185\u5B58\u6570\u636E${s===0?"\u5F3A\u5236\u66F4\u65B0":"\u5DF2\u8FC7\u671F"}\uFF0C\u4FDD\u7559\u8001\u6570\u636E\u670D\u52A1\u672C\u6B21\u8BF7\u6C42\uFF0C\u542F\u52A8\u540E\u53F0\u9759\u9ED8\u66F4\u65B0...`),NIe(n));return}if(n&&Tu.default.existsSync(n))try{let l=Tu.default.statSync(n),d=process.memoryUsage().heapUsed,m=Date.now();Mo=JSON.parse(Tu.default.readFileSync(n,"utf-8")),Mo?.items?.length>0&&Mo.items[0]._flatText===void 0?(Mo=rH0(Mo),Tu.default.writeFileSync(n,JSON.stringify(Mo),"utf-8"),OIe(Mo.items)):Mo?.items?.length>0&&OIe(Mo.items);let g=process.memoryUsage().heapUsed,y=Date.now()-m;fE=Math.max(0,(g-d)/1024/1024).toFixed(2);let v=(process.memoryUsage().rss/1024/1024).toFixed(2);SX=Date.now(),U("info",`[system] [Bangumi-Data] \u6210\u529F\u4ECE\u672C\u5730\u78C1\u76D8\u52A0\u8F7D\u57FA\u7840\u6570\u636E\uFF0C\u6761\u76EE\u6570: ${Mo.items.length}\uFF0C\u89E3\u6790\u8017\u65F6: ${y} ms\uFF0C\u7EA6\u5360\u5185\u5B58: ${fE} MB`),(s===0||Date.now()-l.mtimeMs>=c)&&t&&!a4&&(U("info",`[system] [Bangumi-Data] \u78C1\u76D8\u6570\u636E${s===0?"\u5F3A\u5236\u66F4\u65B0":"\u5DF2\u8FC7\u671F"}\uFF0C\u4FDD\u7559\u8001\u6570\u636E\u670D\u52A1\u672C\u6B21\u8BF7\u6C42\uFF0C\u542F\u52A8\u540E\u53F0\u9759\u9ED8\u66F4\u65B0...`),NIe(n));return}catch(l){U("error","[system] [Bangumi-Data] \u78C1\u76D8\u7F13\u5B58\u89E3\u6790\u5931\u8D25\uFF0C\u51C6\u5907\u91CD\u65B0\u4E0B\u8F7D",l.message),Mo=null}if(a4){if(t){U("info","[system] [Bangumi-Data] \u6B63\u5728\u7B49\u5F85\u57FA\u7840\u6570\u636E\u4E0B\u8F7D\u5B8C\u6210...");let l=0;for(;a4;){if(l>150){U("warn","[system] [Bangumi-Data] \u7B49\u5F85\u6392\u961F\u8D85\u65F6\uFF0C\u653E\u5F03\u7B49\u5F85"),a4=!1;break}await new Promise(d=>setTimeout(d,100)),l++}}}else{U("info","[system] [Bangumi-Data] \u672A\u547D\u4E2D\u4EFB\u4F55\u6709\u6548\u7F13\u5B58\uFF0C\u6B63\u5728\u83B7\u53D6\u57FA\u7840\u6570\u636E...");let l=NIe(n);t?await l:U("info","[system] [Bangumi-Data] \u5F53\u524D\u975E\u6838\u5FC3\u8BF7\u6C42\uFF0C\u6570\u636E\u83B7\u53D6\u8F6C\u5165\u540E\u53F0\u5F02\u6B65\u6267\u884C")}}var d7r=new Set(["anidb","bangumi","gamer","gamer_hk","bilibili","bilibili_hk_mo_tw","bilibili_hk_mo","bilibili_tw","tmdb"]);function rH0(e){if(!e||!e.items)return{items:[]};let t=[];for(let n of e.items){let s=[];if(n.sites){for(let m of n.sites)if(d7r.has(m.site)){let g={site:m.site,id:m.id};m.season_id&&(g.season_id=String(m.season_id)),m.video_sn&&(g.video_sn=String(m.video_sn)),m.comment&&(g.comment=m.comment),m.related&&(g.related=m.related),s.push(g)}}if(s.length===0)continue;let c={title:n.title,type:n.type,sites:s};n.begin&&(c.begin=n.begin),n.titleTranslate&&(c.titleTranslate=n.titleTranslate);let l=n.title;if(n.titleTranslate)for(let m in n.titleTranslate){let g=n.titleTranslate[m];for(let y=0;y<g.length;y++)l+=g[y]}let d=pi(l);c._flatText=Yn(d).toLowerCase().replace(tH0,""),t.push(c)}return{items:t}}async function p7r(e){U("info","[system] [Bangumi-Data] \u5F00\u59CB\u4F18\u9009\u8282\u70B9\u4E0B\u8F7D\u6700\u65B0\u6570\u636E\u5E76\u6267\u884C\u7CBE\u7B80...");try{let t=process.memoryUsage().heapUsed,n=Date.now(),s=0;zG0=await l7r();let c=ZG0[zG0]||ZG0.custom,l={headers:{"Accept-Encoding":"br, gzip, deflate"}},d=c.map(()=>new AbortController);c.forEach(I=>{U("info",`[system] [\u8BF7\u6C42\u6A21\u62DF] HTTP GET: ${I}`)});let m=c.map(async(I,N)=>{let C=d[N],B=await O7(I,{...l,signal:C.signal});if(!B.ok)throw new Error(`HTTP error ${B.status} from ${I}`);let L=await B.json(),q=L.items?L.items.length:0;if(C.signal.aborted)throw new Error("Aborted before parsing");let W=Date.now(),F=rH0(L),J=Date.now()-W,ee=null;return e&&!C.signal.aborted&&(ee=`${e}.tmp${N}`,Tu.default.writeFileSync(ee,JSON.stringify(F),"utf-8")),{index:N,url:I,tempFilePath:ee,resultData:F,pruneCost:J,originalCount:q}}),g=await Promise.any(m);d.forEach((I,N)=>{N!==g.index&&I.abort()}),e&&(c.forEach((I,N)=>{if(N!==g.index){let C=`${e}.tmp${N}`;if(Tu.default.existsSync(C))try{Tu.default.unlinkSync(C)}catch{}}}),Tu.default.renameSync(g.tempFilePath,e));let y=((Date.now()-n)/1e3).toFixed(2);U("info",`[system] [Bangumi-Data] \u7CBE\u7B80\u6570\u636E\u5DF2\u6210\u529F\u5199\u5165\u78C1\u76D8 (\u8282\u70B9: ${new URL(g.url).hostname} ,\u9636\u6BB5\u8017\u65F6: ${y} \u79D2)`),Mo=g.resultData,s=g.pruneCost,OIe(Mo.items),p8.clear();let v=process.memoryUsage().heapUsed,w=((Date.now()-n)/1e3).toFixed(2);fE=Math.max(0,(v-t)/1024/1024).toFixed(2);let T=(process.memoryUsage().rss/1024/1024).toFixed(2);SX=Date.now(),U("info",`[system] [Bangumi-Data] \u52A0\u8F7D\u5230\u5185\u5B58\u6210\u529F\uFF0C\u4FDD\u7559/\u539F\u59CB\u6761\u76EE\u6570: ${Mo.items.length} / ${g.originalCount}\uFF0C\u5904\u7406\u8017\u65F6: ${s} ms\uFF0C\u5168\u94FE\u8DEF\u603B\u8017\u65F6: ${w} \u79D2\uFF0C\u51C0\u589E\u5185\u5B58: ${fE} MB (\u5F53\u524D\u9879\u76EE\u603B\u5360\u7528: ${T} MB)`)}catch(t){let n=t instanceof AggregateError?t.errors.map(s=>s.message).join(" | "):t.message;U("error","[system] [Bangumi-Data] \u4E0B\u8F7D\u5931\u8D25 (\u6240\u6709 CDN \u5747\u672A\u54CD\u5E94\u6216\u62A5\u9519):",n)}}async function qd(e,t){if(await f7r(),!Mo||!Mo.items)return[];let n=p8.get(e);if(!n){if(n=(async()=>{let g=[],y=[e];try{y=[...new Set([e,pi(e),wl(e)])]}catch{}let w=[pi(e)].map(C=>{let B=C.replace(tH0,"");return B=Yn(B).toLowerCase(),B.length>=2?B:Yn(C).toLowerCase()}).filter(C=>C.length>0),T=null;if(typeof ub<"u"&&ub.size>0&&w.length>0){let C=new Set;for(let B of w){let L=Array.from(new Set(B.replace(s7r,"")));if(L.length===0)continue;L.sort((F,J)=>{let ee=ub.get(F)?.length||0,ne=ub.get(J)?.length||0;return ee-ne});let q=ub.get(L[0]);if(!q||q.length===0)continue;let W=new Set(q);for(let F=1;F<L.length;F++){let J=ub.get(L[F]);if(!J){W.clear();break}let ee=new Set(J);for(let ne of W)ee.has(ne)||W.delete(ne);if(W.size===0)break}for(let F of W)C.add(F)}T=Array.from(C)}else T=Mo.items.map((C,B)=>B);let I=Mo.items,N=y.length;for(let C=0;C<T.length;C++){let B=I[T[C]],L=!1;for(let q=0;q<N;q++){let W=y[q];if(Er(B.title,W)){L=!0;break}if(B.titleTranslate)for(let F in B.titleTranslate){let J=B.titleTranslate[F];for(let ee=0;ee<J.length;ee++)if(J[ee]&&Er(J[ee],W)){L=!0;break}if(L)break}if(L)break}if(L){let q=[B.title];if(B.titleTranslate)for(let W in B.titleTranslate){let F=B.titleTranslate[W];for(let J=0;J<F.length;J++)q.push(F[J])}g.push({item:B,titles:q})}}return g})(),p8.size>100){let g=p8.keys().next().value;p8.delete(g)}p8.set(e,n)}let s=await n,c=s,l=an(e);if(l!==null){let g=s.filter(({item:y})=>{let v=Hr(y.title).season;if(v===null&&y.titleTranslate)for(let w in y.titleTranslate){let T=y.titleTranslate[w];for(let I=0;I<T.length;I++){let N=Hr(T[I]).season;if(N!==null){v=N;break}}if(v!==null)break}return l>1?(v||1)===l:l===1?v===null||v===1:!0});g.length>0&&(c=g)}let d=o7r,m=[];for(let{item:g,titles:y}of c){if(!g.sites)continue;let v=g.sites.filter(w=>t.includes(w.site));for(let w of v){let T="TV\u52A8\u753B",I="tvseries";g.type==="movie"?(T="\u5267\u573A\u7248",I="movie"):g.type==="tv"?(T="TV\u52A8\u753B",I="tvseries"):g.type==="ova"?(T="OVA",I="ova"):g.type==="web"&&(T="WEB\u52A8\u753B",I="web");let N="";["bilibili_hk_mo_tw","bilibili_hk_mo","bilibili_tw"].includes(w.site)&&(N="\uFF08\u6E2F\u6FB3\u53F0\uFF09");let C=[],B=[];if(w.comment){let q=w.comment.split(x7r),W=new Map;if(w.related&&Array.isArray(w.related))for(let F of w.related)F.id&&W.set(String(F.id),F.season_id||null);for(let F of q){let J=F.split(c7r);if(J.length>=2){let ee=J[0].trim(),ne=J[1].trim();ne&&d.test(ee)&&C.push({title:g.title,titles:[...y],begin:g.begin,siteId:ne,matchedSiteKey:w.site,type:g.type,typeStr:T,typeId:I,titleSuffix:` ${ee}${N}`,season_id:W.get(ne)||null})}else if(J.length===1&&J[0].trim()){let ee=J[0].trim();d.test(ee)&&B.push(ee)}}}let L="";B.length>0&&(L+=` ${B.join(" ")}`),L+=N,m.push({title:g.title,titles:[...y],begin:g.begin,siteId:w.id,matchedSiteKey:w.site,type:g.type,typeStr:T,typeId:I,titleSuffix:L,season_id:w.season_id||null,video_sn:w.video_sn||null}),m.push(...C)}}return m7r(m,e)}function m7r(e,t){let n=[t];try{n=[...new Set([t,pi(t),wl(t)])]}catch{}e.sort((l,d)=>{let m=l.titles.some(y=>y&&n.includes(y)),g=d.titles.some(y=>y&&n.includes(y));return m&&!g?-1:!m&&g?1:0});let s=[],c=new Map;for(let l of e){if(l.matchedSiteKey==="tmdb"){s.push(l);continue}let d=`${l.matchedSiteKey}:${l.siteId}`,m=c.get(d);if(m===void 0)c.set(d,s.length),s.push(l);else{let g=s[m];for(let y of l.titles)y&&!g.titles.includes(y)&&g.titles.push(y)}}return s}function DIe(e=!1){if(Mo!==null){let t=Mo.items?Mo.items.length:0;Mo=null,SX=0,p8.clear(),ub.clear();let n=(process.memoryUsage().rss/1024/1024).toFixed(2);U("info",`[system] [Bangumi-Data] \u5185\u5B58\u7F13\u5B58\u5DF2\u4E3B\u52A8\u91CA\u653E (\u539F\u6761\u76EE\u6570: ${t}\uFF0C\u91CA\u653E: ${fE} MB\uFF0C\u5F53\u524D\u9879\u76EE\u603B\u5360\u7528: ${n} MB)`),fE="0.00",TL=!1}if(e&&Tu.default.existsSync(EX))try{let t=TX.default.join(EX,eH0);Tu.default.existsSync(t)&&Tu.default.unlinkSync(t);for(let n=0;n<5;n++){let s=`${t}.tmp${n}`;Tu.default.existsSync(s)&&Tu.default.unlinkSync(s)}U("info","[system] [Bangumi-Data] \u78C1\u76D8\u7F13\u5B58\u5DF2\u540C\u6B65\u6E05\u7406")}catch(t){U("error",`[system] [Bangumi-Data] \u78C1\u76D8\u7F13\u5B58\u6E05\u7406\u5931\u8D25: ${t.message}`)}}var CX=new Map;async function IL(e,t={}){let s=`https://api.tmdb.org/3/${e}`,c=te.makeProxyUrl(s);try{let l=await R0(c,{method:"GET",headers:{"Content-Type":"application/json","User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"},signal:t.signal});return l.status!=200?null:l}catch(l){if(l.name==="AbortError")throw l;return U("error","[system] [tmdb] Api error:",{message:l.message,name:l.name,stack:l.stack}),null}}async function NX(e,t="multi",n={}){let{page:s=1,maxPages:c=3,signal:l=null}=n;if(n.page!==void 0){let m=`search/${t}?api_key=${te.tmdbApiKey}&query=${encodeURIComponent(e)}&language=zh-CN&page=${s}`;return await IL(m,{signal:l})}let d=[];for(let m=1;m<=c;m++){if(l&&l.aborted)throw new DOMException("Aborted","AbortError");let g=`search/${t}?api_key=${te.tmdbApiKey}&query=${encodeURIComponent(e)}&language=zh-CN&page=${m}`,y=await IL(g,{signal:l});if(!y||!y.data)break;let v=typeof y.data=="string"?JSON.parse(y.data):y.data;if(!v.results||v.results.length===0||(d.push(...v.results),v.results.length<20))break}return U("info",`[system] [tmdb] \u5171\u83B7\u53D6\u5230 ${d.length} \u6761\u641C\u7D22\u7ED3\u679C\uFF08\u6700\u591A${c}\u9875\uFF09`),{data:{results:d},status:200}}async function h7r(e,t,n={}){let s=`${e}/${t}?api_key=${te.tmdbApiKey}&language=ja-JP`;return await IL(s,n)}async function iH0(e,t,n={}){let s=`${e}/${t}/external_ids?api_key=${te.tmdbApiKey}`;return await IL(s,n)}async function g7r(e,t,n={}){let s=`${e}/${t}/alternative_titles?api_key=${te.tmdbApiKey}`;return await IL(s,n)}function b7r(e,t,n=""){let s=e?.data?.results||e?.data?.titles||[];if(!s.length)return null;let c=(n||"").toLowerCase().trim(),l=m=>m.title||m.name||"",d=[m=>c&&l(m).toLowerCase().trim()===c,...["CN","TW","HK","SG"].map(m=>g=>(g.iso_3166_1||g.iso_639_1)===m&&!hh(l(g))),m=>!hh(l(m))];for(let m of d){let g=s.find(m);if(g){let y=l(g);return U("info",`[system] [tmdb] \u6309\u4F18\u5148\u7EA7\u7B56\u7565\u6210\u529F\u63D0\u53D6\u6700\u4F73\u4E2D\u6587\u522B\u540D: ${y}`),y}}return null}async function y7r(e,t,n=""){let s=e.name||e.title||"";if(n&&s.toLowerCase().trim()===n.toLowerCase().trim()||!(hh(s)||n&&s.toLowerCase().trim()!==n.toLowerCase().trim()))return s;U("info",`[system] [tmdb] \u5C1D\u8BD5\u83B7\u53D6\u4E2D\u6587\u522B\u540D\u4EE5\u5BFB\u627E\u66F4\u4F18\u5339\u914D (\u5F53\u524D\u6807\u9898: "${s}")`);let l=e.media_type||(e.name?"tv":"movie");try{if(t&&t.aborted)throw new DOMException("Aborted","AbortError");let d=await g7r(l,e.id,{signal:t});if(t&&t.aborted)throw new DOMException("Aborted","AbortError");let m=b7r(d,l,n);return m?(U("info",`[system] [tmdb] \u5C06\u4F7F\u7528\u4E2D\u6587\u522B\u540D\u8FDB\u884C\u76F8\u4F3C\u5339\u914D: ${m}`),m):(U("info",`[system] [tmdb] \u672A\u627E\u5230\u4E2D\u6587\u522B\u540D\uFF0C\u4F7F\u7528\u539F\u6807\u9898: ${s}`),s)}catch(d){if(d.name==="AbortError")throw d;return U("error",`[system] [tmdb] \u83B7\u53D6\u522B\u540D\u5931\u8D25: ${d.message}`),s}}async function dE(e,t=null,n="Unknown"){let s=xH0(e);if(s!==e&&U("info",`[system] [tmdb] \u4F18\u5316\u641C\u7D22\u5173\u952E\u8BCD: "${e}" -> "${s}"`),te.useBangumiData){let m=await qd(s,["tmdb","bangumi","anidb"]);if(m&&m.length>0){m.length>1&&m.sort((w,T)=>{let I=w.titles.some(C=>C===s),N=T.titles.some(C=>C===s);return I&&!N?-1:!I&&N?1:0});let g=m[0],y=g.titles.find(w=>w&&w.includes(s))||g.titles[1]||g.title,v=g.title;return U("info",`[system] [tmdb] Bangumi-Data \u672C\u5730\u547D\u4E2D\uFF0C\u63D0\u53D6\u539F\u540D\u6210\u529F: \u539F\u540D=${v}, \u522B\u540D=${y}\uFF08\u68C0\u7D22\u8BCD\uFF1A${s}\uFF09`),{title:v,cnAlias:y}}}if(!te.tmdbApiKey)return U("info","[system] [tmdb] \u672A\u914D\u7F6EAPI\u5BC6\u94A5\uFF0C\u8DF3\u8FC7TMDB\u7F51\u7EDC\u641C\u7D22"),null;let c=CX.get(s);if(c)U("info",`[system] [tmdb] \u52A0\u5165\u6B63\u5728\u8FDB\u884C\u7684\u641C\u7D22: ${s} (${n})`);else{let m=new AbortController;c={controller:m,refCount:0,promise:(async()=>{try{let y=m.signal,v=se=>{let he=se.genre_ids||[],be=se.genres||[],ke=he.length>0?he:be.map(Ye=>Ye.id),Se=se.original_language||"";return ke.includes(16)?{isValid:!0,reason:"\u660E\u786E\u52A8\u753B\u7C7B\u578B(genre_id: 16)"}:Se==="ja"?{isValid:!0,reason:"\u539F\u59CB\u8BED\u8A00\u4E3A\u65E5\u8BED(ja),\u53EF\u80FD\u662F\u65E5\u5267/\u65E5\u5F71/\u65E5\u7EFC\u827A"}:{isValid:!1,reason:`\u975E\u52A8\u753B\u4E14\u975E\u65E5\u8BED\u5185\u5BB9(language: ${Se}, genres: ${ke.join(",")})`}},w=(se,he)=>{let be=O0=>O0.toLowerCase().replace(/\s+/g,"").replace(/[：:、，。！？；""''（）【】《》]/g,"").trim(),ke=be(se),Se=be(he);if(ke===Se)return 1;let Je=ke.length<Se.length?ke:Se,Ye=ke.length>=Se.length?ke:Se;if(Ye.includes(Je)&&Je.length>0)return .6+Je.length/Ye.length*.3;let Ue=se.length>he.length?se:he,o0=se.length>he.length?he:se;if(Ue.length===0)return 1;let f0=(O0,tt)=>{O0=O0.toLowerCase(),tt=tt.toLowerCase();let ct=[];for(let h0=0;h0<=O0.length;h0++){let Lt=h0;for(let mt=0;mt<=tt.length;mt++)if(h0===0)ct[mt]=mt;else if(mt>0){let wt=ct[mt-1];O0.charAt(h0-1)!==tt.charAt(mt-1)&&(wt=Math.min(Math.min(wt,Lt),ct[mt])+1),ct[mt-1]=Lt,Lt=wt}h0>0&&(ct[tt.length]=Lt)}return ct[tt.length]};return(Ue.length-f0(Ue,o0))/Ue.length};if(U("info",`[system] [tmdb] \u6B63\u5728\u641C\u7D22 (Shared Task): ${s}`),y.aborted)throw new DOMException("Aborted","AbortError");let T=await NX(s,"multi",{signal:y});if(!T||!T.data)return U("info","[system] [tmdb] TMDB\u641C\u7D22\u7ED3\u679C\u4E3A\u7A7A"),null;let I=typeof T.data=="string"?JSON.parse(T.data):T.data;if(!I.results||I.results.length===0)return U("info","[system] [tmdb] TMDB\u672A\u627E\u5230\u4EFB\u4F55\u7ED3\u679C"),null;let N=[],C=[];for(let se of I.results){let he=v(se);if(he.isValid)N.push(se);else{let be=se.name||se.title||"\u672A\u77E5";C.push(`${be}(${he.reason})`)}}if(N.length===0)return U("info","[system] [tmdb] \u6570\u636E\u6E05\u6D17\u62E6\u622A: \u641C\u7D22\u7ED3\u679C\u4E2D\u6CA1\u6709\u4EFB\u4F55\u76EE\u6807\u7C7B\u578B(\u52A8\u753B/\u65E5\u6587)\u7684\u5185\u5BB9"),null;U("info",`[system] [tmdb] \u6570\u636E\u6E05\u6D17\u5B8C\u6210: \u4FDD\u7559 ${N.length} \u4E2A\u6709\u6548\u6761\u76EE\u53C2\u4E0E\u5339\u914D\uFF0C\u8FC7\u6EE4 ${C.length} \u4E2A\u65E0\u5173\u6761\u76EE${C.length>0?"\uFF0C\u8FC7\u6EE4\u8BE6\u60C5: "+C.join(", "):""}`);let B=null,L=-1,q=null,W=0,F=5,J=!1;for(let se of N){let he=se.name||se.title||"";if(!he)continue;let be=w(s,he),ke=se.original_name||se.original_title||"",Se=ke?w(s,ke):0,Je=Math.max(be,Se);if(Je===1&&!J){J=!0,U("info",`[system] [tmdb] \u5339\u914D\u68C0\u67E5 "${he}" - \u76F8\u4F3C\u5EA6: 100.00% (\u5B8C\u5168\u5339\u914D\uFF0C\u8DF3\u8FC7\u540E\u7EED\u6240\u6709\u522B\u540D\u641C\u7D22)`),Je>L&&(L=Je,B=se,q=he);continue}let Ye,Ue,o0=he.toLowerCase().trim()===s.toLowerCase().trim();if(J||o0)Ye=he,Ue=Je,J&&o0?U("info",`[system] [tmdb] \u5339\u914D\u68C0\u67E5 "${he}" - \u76F8\u4F3C\u5EA6: ${(Ue*100).toFixed(2)}% (\u5DF2\u627E\u5230\u5B8C\u5168\u5339\u914D\uFF0C\u8DF3\u8FC7\u522B\u540D\u641C\u7D22)`):U("info",`[system] [tmdb] \u5339\u914D\u68C0\u67E5 "${he}" - \u76F8\u4F3C\u5EA6: ${(Ue*100).toFixed(2)}%`);else{if(W<F)try{Ye=await y7r(se,y,s),Ye!==he&&W++}catch(tt){if(tt.name==="AbortError")throw tt;U("error",`[system] [tmdb] \u5904\u7406\u7ED3\u679C\u5931\u8D25: ${tt.message}`),Ye=he}else Ye=he,U("info",`[system] [tmdb] \u5DF2\u8FBE\u5230\u522B\u540D\u83B7\u53D6\u4E0A\u9650(${F})\uFF0C\u4F7F\u7528\u539F\u6807\u9898: ${he}`);let f0=w(s,Ye);Ue=Math.max(f0,Se);let O0=Ye!==he?`"${he}" (\u522B\u540D: ${Ye})`:`"${he}"`;U("info",`[system] [tmdb] \u5339\u914D\u68C0\u67E5 ${O0} - \u76F8\u4F3C\u5EA6: ${(Ue*100).toFixed(2)}%`),Ue===1&&!J&&(J=!0,U("info","[system] [tmdb] \u901A\u8FC7\u522B\u540D\u627E\u5230\u5B8C\u5168\u5339\u914D\uFF0C\u8DF3\u8FC7\u540E\u7EED\u6240\u6709\u522B\u540D\u641C\u7D22"))}Ue>L&&(L=Ue,B=se,q=Ye)}if(!B||L<.4)return U("info",`[system] [tmdb] \u6700\u4F73\u5339\u914D\u76F8\u4F3C\u5EA6\u8FC7\u4F4E\u6216\u672A\u627E\u5230\u5339\u914D (${B?(L*100).toFixed(2)+"%":"N/A"}),\u8DF3\u8FC7`),null;U("info",`[system] [tmdb] TMDB\u6700\u4F73\u5339\u914D: ${q}, \u76F8\u4F3C\u5EA6: ${(L*100).toFixed(2)}%`);let ne=B.media_type||(B.name?"tv":"movie"),re=await h7r(ne,B.id,{signal:y}),ae;if(!re||!re.data)ae=B.name||B.title,U("info",`[system] [tmdb] \u4F7F\u7528\u4E2D\u6587\u641C\u7D22\u7ED3\u679C\u6807\u9898: ${ae}`);else{let se=typeof re.data=="string"?JSON.parse(re.data):re.data;ae=se.original_name||se.original_title||se.name||se.title,U("info",`[system] [tmdb] \u627E\u5230\u65E5\u8BED\u539F\u540D: ${ae}`)}return{title:ae,cnAlias:q}}catch(y){return y.name==="AbortError"?(U("info",`[system] [tmdb] \u540E\u53F0\u641C\u7D22\u4EFB\u52A1\u5DF2\u5B8C\u5168\u7EC8\u6B62 (${s})`),null):(U("error","[system] [tmdb] Background Search error:",{message:y.message,name:y.name,stack:y.stack}),null)}})().finally(()=>{CX.delete(s)})},CX.set(s,c),U("info",`[system] [tmdb] \u542F\u52A8\u65B0\u641C\u7D22\u4EFB\u52A1: ${s}`)}c.refCount++;let l=()=>{CX.get(s)===c&&(c.refCount--,c.refCount<=0&&(U("info",`[system] [tmdb] \u6240\u6709\u8C03\u7528\u8005\u5DF2\u53D6\u6D88\uFF0C\u7EC8\u6B62\u540E\u53F0\u8BF7\u6C42: ${s}`),c.controller.abort()))},d;if(t){if(t.aborted)return l(),U("info",`[system] [tmdb] \u641C\u7D22\u5DF2\u88AB\u4E2D\u65AD (Source: ${n})`),null;t.addEventListener("abort",l)}try{let m=new Promise((g,y)=>{t&&(d=()=>y(new DOMException("Aborted","AbortError")),t.addEventListener("abort",d))});return await Promise.race([c.promise,m])}catch(m){return m.name==="AbortError"?(U("info",`[system] [tmdb] \u641C\u7D22\u5DF2\u88AB\u4E2D\u65AD (Source: ${n})`),null):(U("error",`[system] [tmdb] \u641C\u7D22\u5F02\u5E38: ${m.message}`),null)}finally{t&&(t.removeEventListener("abort",l),d&&t.removeEventListener("abort",d))}}async function aH0(e,t=null,n=null){if(!hh(e))return e;if(te.useBangumiData){let l=xH0(e),d=await qd(l,["tmdb","bangumi","anidb"]);if(d&&d.length>0){let m=d[0],g=m.titles.find(y=>y&&!hh(y))||m.titles[1];if(g&&!hh(g))return U("info",`[system] [tmdb] \u547D\u4E2D\u672C\u5730 Bangumi Data: ${e} -> ${g}\uFF08\u68C0\u7D22\u8BCD\uFF1A${l}\uFF09`),g}}let s=t!=null,c=s?"tv":"movie";try{let l=await NX(e,c);if(!l.data.results||l.data.results.length===0)return U("info","[system] [tmdb] TMDB\u672A\u627E\u5230\u4EFB\u4F55\u7ED3\u679C"),e;let m=l.data.results.find(y=>{let v=s?y.name:y.title;return v&&!hh(v)})||l.data.results[0],g=s?m.name:m.title;return g?(U("info",`\u539F\u6807\u9898: ${e} -> \u4E2D\u6587\u6807\u9898: ${g}`),g):e}catch(l){return U("error","\u67E5\u8BE2 TMDB \u65F6\u51FA\u9519:",l),e}}var oH0=/(?:\s+|^)(?:第?\s*(?:\d+|[一二三四五六七八九十]+)\s*[季期部]|season\s*\d+|s\d+|part\s*\d+|act\s*\d+|phase\s*\d+|the\s+final\s+season|(?:movie|film|ova|oad|sp|剧场版|劇場版|续[篇集]|外传)(?![a-z]))|[:：~～]|\s+.*?篇|(?<=\s|^)\d+$/i,nH0=/[ :：~～]/;function sH0(e){let t=e.match(oH0);return t?t.index:e.length}function xH0(e){let t=sH0(e);return t<e.length?e.substring(0,t).trim():e}function pE(e,t){if(!e||e.length===0||!t)return;let n=0;for(let l of e)l._displayTitle=l._displayTitle||l.title||"",l.isLocalPriority||l._displayTitle.includes(t)||n++;if(n===0)return;U("info",`[system] [tmdb] \u542F\u52A8\u667A\u80FD\u66FF\u6362\uFF0C\u76EE\u6807\u522B\u540D: "${t}"\uFF0C\u5F85\u5904\u7406\u6761\u76EE: ${n}`);let s=e.map(l=>{let d=l.org_title||l.title||"";return d.substring(0,sH0(d))}),c="";if(s.length>0){let l=s.concat().sort(),d=l[0],m=l[l.length-1],g=0;for(;g<d.length&&d.charAt(g)===m.charAt(g);)g++;c=d.substring(0,g)}c&&c.length>1&&U("info",`[system] [tmdb] \u8BA1\u7B97\u51FA\u6700\u957F\u516C\u5171\u524D\u7F00 (LCP): "${c}"`);for(let l of e){let d=l.title||"";if(!(l.isLocalPriority||d.includes(t)))if(c&&c.length>1&&d.startsWith(c)){let m=d.substring(c.length).trim();l._displayTitle=m?`${t}${m.match(/^[~～:：]/)?"":" "}${m}`:t,U("info",`[system] [tmdb] [LCP\u6A21\u5F0F] "${d}" -> "${l._displayTitle}"`)}else{let m=d.match(nH0);if(m){let g=d.substring(0,m.index).trim(),y=d.substring(m.index);if(g&&oH0.test(g)){let v=y.trim().match(nH0),w=v?y.trim().substring(v.index):"";l._displayTitle=`${g} ${t}${w}`,U("info",`[system] [tmdb] [\u524D\u7F00\u4FDD\u62A4\u6A21\u5F0F] "${d}" -> "${l._displayTitle}"`)}else l._displayTitle=t+y,U("info",`[system] [tmdb] [\u5206\u9694\u7B26\u6A21\u5F0F] "${d}" -> "${l._displayTitle}"`)}else hh(d)?(l._displayTitle=t,U("info",`[system] [tmdb] [\u7EAF\u5916\u6587\u5168\u66FF\u6A21\u5F0F] "${d}" -> "${l._displayTitle}"`)):U("info",`[system] [tmdb] [\u8DF3\u8FC7\u66FF\u6362] "${d}" \u542B\u6709\u4E2D\u6587\u4E14\u7279\u5F81\u4E0D\u7B26\uFF0C\u62D2\u7EDD\u5F3A\u5236\u5168\u66FF\u4EE5\u9632\u8BEF\u6740`)}}}function A7r(e){let t=new Map;for(let s of e){if(!s||s.matchedSiteKey!=="tmdb"||!s.siteId)continue;let c=s.siteId.match(/^(tv\/\d+)(?:\/season\/\d+\/episode\/(\d+))?$/);if(!c)continue;let l=c[1],m={order:0,startEpisode:c[2]?parseInt(c[2],10):1,title:s.title||"",tmdbId:l};t.has(l)?t.get(l).push(m):t.set(l,[m])}if(t.size===0)return null;let n=[...t.entries()].sort((s,c)=>c[1].length-s[1].length)[0];if(n[1].length<2)return null;n[1].sort((s,c)=>s.startEpisode-c.startEpisode);for(let s=0;s<n[1].length;s++)n[1][s].order=s+1;return n[1]}async function cH0(e,t=qd){if(!te.useBangumiData)return null;try{let n=await t(e,["tmdb"]);return A7r(n)}catch(n){return U("warn",`[system] [tmdb] Bangumi-Data \u672C\u5730\u83B7\u53D6TMDB\u5B63\u8FB9\u754C\u5931\u8D25: ${n.message}\uFF08\u68C0\u7D22\u8BCD\uFF1A${e}\uFF09`),null}}Pr();$r();Ga();x6();Xi();var Cf="$$$",m8="&",k7r=!1,Bx=Object.freeze({TITLE_STRUCTURE_CONFLICT:-.3,LANG_MATCH_CN:.15,LANG_MISMATCH:-.2,DATE_MATCH:0,EP_ALIGN:{MOVIE_TYPE_MISMATCH:-5,SPECIAL_STRICT_MISMATCH:-8,LANG_MATCH:3,LANG_MISMATCH:-5,SEASON_NUM_MISMATCH:-10,SPECIAL_TYPE_MISMATCH:-10,SPECIAL_TYPE_MATCH:3,IS_SPECIAL_MATCH:3,SEASON_SHIFT_EXACT:15,CN_STRICT_MATCH:25,CN_STRICT_MISMATCH:-5,NUMERIC_MATCH:2,PATTERN_CONSISTENCY_BONUS:2,ZERO_DIFF_BONUS_BASE:100,ZERO_DIFF_BONUS_PER_HIT:5}}),vp=Object.freeze({SIMILARITY_MIN:.65,SIMILARITY_STRONG:.98,TIER_DEFAULT:.001,TIER_CN:.4,TIER_PART:.5,COLLECTION_RATIO:4,COLLECTION_DIFF:6});function Wr(e,...t){typeof t[0]=="string"&&t[0].includes("[Merge-Check]")&&!k7r||U(e,...t)}var N0={Lang:{CN:/(普通[话話]|[国國][语語]|中文配音|中配|中文|[粤粵][语語]配音|[粤粵]配|[粤粵][语語]|[台臺]配|[台臺][语語]|港配|港[语語]|字幕|助[听聽])(?:版)?/,JP:/(日[语語]|日配|原版|原[声聲])(?:版)?/,CN_DUB_VER:/(\(|（|\[)?(普通[话話]|[国國][语語]|中文配音|中配|中文|[粤粵][语語]配音|[粤粵]配|[粤粵][语語]|[台臺]配|[台臺][语語]|港配|港[语語]|字幕|助[听聽])版?(\)|）|\])?/g,JP_DUB_VER:/(\(|（|\[)?(日[语語]|日配|原版|原[声聲])版?(\)|）|\])?/g,KEYWORDS_STRONG:/(?:普通[话話]|[国國][语語]|中文配音|中配|中文|[粤粵][语語]配音|[粤粵]配|[粤粵][语語]|[台臺]配|[台臺][语語]|港配|港[语語]|字幕|助[听聽]|日[语語]|日配|原版|原[声聲])(?:版)?/g,CN_STD:/普通[话話]|[国國][语語]|中文配音|中配|中文|[粤粵][语語]配音|[粤粵]配|[粤粵][语語]|[台臺]配|[台臺][语語]|港配|港[语語]|字幕|助[听聽]/g,JP_STD:/日[语語]|日配|原版|原[声聲]/g},Season:{PURE_PART:/^(?:(?:第|S(?:eason)?)\s*\d+(?:季|期|部)?|(?:Part|P|第)\s*\d+(?:部分)?)$/i,PART_NORM:/第\s*(\d+)\s*部分/g,PART_NORM_2:/(?:Part|P)[\s.]*(\d+)/gi,FINAL:/(?:The\s+)?Final\s+Season/gi,NORM:/(?:Season|S)\s*(\d+)/gi,CN:/第\s*([一二三四五六七八九十]+)\s*季/g,ROMAN:/(\s|^)(IV|III|II|I)(\s|$)/g,INFO_STRONG:/(?:season|s|第)\s*[0-9一二三四五六七八九十]+\s*(?:季|期|部(?!分))?/gi,PART_INFO_STRONG:/(?:part|p|第)\s*\d+\s*(?:部分)?/gi,PART_ANY:/(?:part|p)\s*\d+/gi,CN_STRUCTURE:/(?:^|\s|×\d+\s?)(承|转|结)(?=$|[\s\(\（\[【])/i,SUFFIX_AMBIGUOUS:/(?:[\s\u4e00-\u9fa5]|^)(S|T|R|II|III|IV)(?=$|[\s\(\（\[【])/i,SUFFIX_SEQUEL:/(?:续篇|续集|The Sequel)/i},Clean:{NA_TAG:/(\(|（|\[)N\/A(\)|）|\])/gi,SOURCE_TAG:/【.*?】/g,REGION_LIMIT:/(\(|（|\[)仅限.*?地区(\)|）|\])/g,PUNCTUATION:/[!！?？,，.。、~～:：\-–—_]/g,WHITESPACE:/\s+/g,FROM_SUFFIX:/\s*from\s+.*$/i,PARENTHESES_CONTENT:/(\(|（|\[).*?(\)|）|\])/g,MOVIE_KEYWORDS:/剧场版|劇場版|the\s*movie|theatrical|movie|film|电影/gi,LONE_VER_CHAR:/(\s|^)版(\s|$)/g,NON_ALPHANUM_CN:/[^\u4e00-\u9fa5a-zA-Z0-9]/g,META_SUFFIX:/(\(|（|\[)(续篇|TV版|无修|未删减|完整版)(\)|）|\])/gi,YEAR_TAG:/(\(|（|\[)\d{4}(\)|）|\]).*$/i,YEAR_DIGITS:/[\(（](\d{4})[\)）]/,SUBTITLE_SEPARATOR:/^[\s:：\-–—(（\[【]/,SPACE_STRUCTURE:/.+[\s\u00A0\u3000].+/,SPLIT_SPACES:/[\s\u00A0\u3000]+/,REDUNDANT_SEPARATOR:/[\s:：~～]/,REDUNDANT_UNSAFE_END:/[\(\（\[【:：~～\-]$/,REDUNDANT_VALID_CHARS:/[\u4e00-\u9fa5a-zA-Z]{2,}/},Episode:{SUFFIX_DIGIT:/_\d+(?=$|\s)/g,FILE_NOISE:/_(\d{2,4})(?=\.)/g,SEASON_PREFIX:/(?:^|\s)(?:第\s*[0-9一二三四五六七八九十]+\s*季|S(?:eason)?\s*\d+)(?:\s+|_)/gi,CLEAN_SMART:/(?:^|\s)(?:EP|E|Vol|Episode|No|Part|第)\s*\d+(?:\.\d+)?(?:\s*[话話集])?(?!\s*[季期部])/gi,PUNCTUATION:/[!！?？,，.。、~～:：\-–—]/g,DANDAN_TAG:/^【(dandan|animeko)】/i,SPECIAL_START:/^S\d+/i,MOVIE_CHECK:/剧场版|劇場版|movie|film/i,PV_CHECK:/(pv|trailer|预告)/i,SPECIAL_CHECK:/^(s|o|sp|special)\d/i,SEASON_MATCH:/(?:^|\s)(?:第|S)\s*(\d+)\s*[季S]/i,NUM_STRATEGY_A:/(?:第|s)\s*(\d+)\s*[季s]\s*(?:第|ep|e)\s*(\d+)/i,NUM_STRATEGY_B:/(?:ep|e|vol|episode|chapter|no|part|第)\s*(\d+(\.\d+)?)(?:\s*[话話集])?(?!\s*[季期部])/i,NUM_STRATEGY_C:/(?:^|\s)(?:第)?(\d+(\.\d+)?)(?:话|集|\s|$)/,DANDAN_IGNORE:/^[SC]\d+/i,MAP_EXCLUDE_KEYWORDS:/(?:^|\s)(?:PV|OP|ED|SP|Special|Drama|OAD|OVA|Opening|Ending|特番|特典|Behind\s+the\s+Scenes|Making|Interview)(?:\s|$|[:：])/i,SINK_TITLE_STRICT:/^(?:S\d+|C\d+|SP\d*|OP\d*|ED\d*|PV\d*|Trailers?|Interview|Making|特番|特典)(?:\s|$|[:：.\-]|\u3000)/i},Category:{ANIME_KW:/(动画|TV动画|动漫|日漫|国漫)/,REAL_KW:/(电视剧|真人剧|综艺|纪录片)/,ANIMEKO_SOURCE:/animeko/i},Similarity:{CN_STRICT_CORE_REMOVE:/[0-9a-zA-Z\s第季集话partEPep._\-–—:：【】()（）]/gi}},PX=[{regex:/(?:\s|^)A's$/i,val:"S2"},{regex:/(?:\s|^)StrikerS$/i,val:"S3"},{regex:/(?:\s|^)ViVid$/i,val:"S4"},{regex:/(?:\s|^)SuperS$/i,val:"S4"}],v7r=[{regex:/(?:第)?\s*(\d+)\s*(?:季|期|部(?!分))/,prefix:"S"},{regex:/\bseason\s*(\d+)/i,prefix:"S"},{regex:/\bs\s*(\d+)\b/i,prefix:"S"},{regex:/\bpart\s*(\d+)/i,prefix:"P"},{regex:/\b(ova|oad)\d*\b/i,val:"OVA"},{regex:/(剧场版|劇場版|the\s*movie|theatrical|movie|film|电影)/i,val:"MOVIE"},{regex:/(续篇|续集)/,val:"SEQUEL"},{regex:/\b(sp|special)\d*\b/i,val:"SP"},{regex:/[^0-9](\d)$/,prefix:"S",useCleaned:!0}],_7r=[{seriesKeywords:["\u7F8E\u5C11\u5973\u6218\u58EB"],mappings:[{markers:["R"],targetStandard:"\u7B2C\u4E8C\u5B63"},{markers:["S"],targetStandard:"\u7B2C\u4E09\u5B63"},{markers:["SuperS","Super S"],targetStandard:"\u7B2C\u56DB\u5B63"},{markers:["Sailor Stars","\u6700\u540E\u7684\u661F\u5149"],targetStandard:"\u7B2C\u4E94\u5B63"}]},{seriesKeywords:["\u5C0F\u6797\u5BB6\u7684\u9F99\u5973\u4EC6"],mappings:[{markers:["S"],targetStandard:"\u7B2C\u4E8C\u5B63"}]},{seriesKeywords:["\u53EF\u80FD\u6210\u4E3A\u604B\u4EBA","\u4E0D\u884C"],mappings:[{markers:["NEXT SHINE","\u518D\u6B21\u95EA\u8000"],targetStandard:"\u7EED\u7BC7"}]},{seriesKeywords:["\u7EA2\u732A","\u5343\u4E0E\u5343\u5BFB","\u9F99\u732B"],defaultStandard:"\u5267\u573A\u7248"}];function AH0(e){return e.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}function PIe(e){if(typeof structuredClone=="function")try{return structuredClone(e)}catch{}return JSON.parse(JSON.stringify(e))}function Rl(e){if(!e)return"Unspecified";let t=e.toLowerCase();return N0.Lang.CN.test(t)?"CN":N0.Lang.JP.test(t)?"JP":"Unspecified"}function kH0(e){if(!e)return"";let t=e,n=t.toUpperCase();for(let s of _7r){if(!s.seriesKeywords.every(d=>n.includes(d.toUpperCase())))continue;let l=!1;if(s.mappings)for(let d of s.mappings)d.markers.forEach(m=>{let g=new RegExp(AH0(m),"gi");g.test(t)&&(t=t.replace(g,` ${d.targetStandard} `),l=!0)});!l&&s.defaultStandard&&(t+=` ${s.defaultStandard} `)}return t}function fb(e){if(!e)return"";let t=pi(e);return t=t.replace(N0.Clean.NA_TAG,""),t=t.replace(N0.Season.PART_NORM,"part $1"),t=t.replace(N0.Season.PART_NORM_2,"part $1"),t=t.replace(N0.Season.FINAL,"\u6700\u7EC8\u5B63"),t=t.replace(N0.Season.NORM,"\u7B2C$1\u5B63"),t=t.replace(N0.Season.CN,(n,s)=>`\u7B2C${ep(s)}\u5B63`),t=t.replace(N0.Season.ROMAN,(n,s,c,l)=>`${s}\u7B2C${{I:"1",II:"2",III:"3",IV:"4"}[c]}\u5B63${l}`),t=t.replace(N0.Lang.CN_DUB_VER,"\u4E2D\u914D\u7248"),t=t.replace(N0.Lang.JP_DUB_VER,""),t=t.replace(N0.Clean.SOURCE_TAG,""),t=t.replace(N0.Clean.REGION_LIMIT,""),t=t.replace(/(\d+)\.(\d+)/g,"$1{{DOT}}$2"),t=t.replace(N0.Clean.PUNCTUATION," "),t=t.replace(/{{DOT}}/g,"."),t.replace(N0.Clean.WHITESPACE," ").toLowerCase().trim()}function zd(e){if(!e)return"";let t=kH0(e);t=pi(t);let n=t.match(/^(?:【|\[)(.+?)(?:】|\])/);if(n){let s=n[1];/^(TV|剧场版|劇場版|movie|film|anime|动漫|动画|AVC|HEVC|MP4|MKV)$/i.test(s)||(t=t.replace(n[0],s+" "))}return t=t.replace(N0.Clean.SOURCE_TAG,""),t=t.replace(N0.Clean.FROM_SUFFIX,""),t=t.replace(N0.Clean.NA_TAG,""),t=t.replace(N0.Clean.PARENTHESES_CONTENT,""),t=t.replace(N0.Season.INFO_STRONG,""),t=t.replace(N0.Season.PART_INFO_STRONG,""),t=t.replace(N0.Clean.MOVIE_KEYWORDS,""),t=t.replace(N0.Lang.KEYWORDS_STRONG,""),t=t.replace(N0.Clean.LONE_VER_CHAR,""),t=t.replace(N0.Clean.NON_ALPHANUM_CN,""),t.toLowerCase()}function mE(e){if(!e)return"";let t=pi(e);return t=t.replace(N0.Episode.SUFFIX_DIGIT,""),t=t.replace(N0.Episode.FILE_NOISE,""),t=t.replace(N0.Episode.SEASON_PREFIX," "),t=t.replace(N0.Episode.CLEAN_SMART," "),t=t.replace(N0.Clean.SOURCE_TAG,""),t=t.replace(N0.Lang.CN_STD,"\u4E2D\u6587"),t=t.replace(N0.Lang.JP_STD,"\u65E5\u6587"),t=t.replace(/(\d+)\.(\d+)/g,"$1{{DOT}}$2"),t=t.replace(N0.Episode.PUNCTUATION," "),t=t.replace(/{{DOT}}/g,"."),t.replace(N0.Clean.WHITESPACE," ").toLowerCase().trim()}function uH0(e){return e?e.replace(N0.Clean.PARENTHESES_CONTENT,"").trim():""}function RL(e){if(!e)return"";let t=String(e).split(Cf)[0].trim();if(t.startsWith("//"))return"https:"+t;let n=t.match(/^([^:]+):(.+)$/);if(n){let s=n[1].toLowerCase(),c=n[2];return s==="http"||s==="https"?t:/^https?:\/\//i.test(c)?c:c.startsWith("//")?"https:"+c:c}return t}function lH0(e){if(!e||e==="N/A")return{year:null,month:null};let t=new Date(e),n=t.getTime();if(isNaN(n))return{year:null,month:null};let s=t.getFullYear();return s>2030?{year:null,month:null}:{year:s,month:t.getMonth()+1}}function w7r(e,t){let n=e.length,s=t.length;if(n===0)return s;if(s===0)return n;let c=new Array(s+1),l=new Array(s+1);for(let d=0;d<=s;d++)c[d]=d;for(let d=1;d<=n;d++){l[0]=d;let m=e.charCodeAt(d-1);for(let y=1;y<=s;y++){let v=m===t.charCodeAt(y-1)?0:1;l[y]=Math.min(l[y-1]+1,c[y]+1,c[y-1]+v)}let g=c;c=l,l=g}return c[s]}function S7r(e,t){if(!e||!t)return 0;let n=new Set(e.replace(N0.Clean.WHITESPACE,"")),s=new Set(t.replace(N0.Clean.WHITESPACE,"")),c=n.size,l=s.size;if(c===0&&l===0)return 1;if(c===0||l===0)return 0;let d=0,[m,g]=c<l?[n,s]:[s,n];for(let y of m)g.has(y)&&d++;return 2*d/(c+l)}function lb(e,t){if(!e||!t)return 0;let n=zd(e),s=zd(t);if(n===""&&s==="")return 0;if(n===s)return 1;let c=n.length,l=s.length,d=Math.max(c,l),m=Math.min(c,l);if(n.includes(s)||s.includes(n)){let F=m/d;if(F>.5)return .8+F*.2}let g=w7r(n,s),y=d===0?1:1-g/d,v=new Set(n.replace(N0.Clean.WHITESPACE,"")),w=new Set(s.replace(N0.Clean.WHITESPACE,"")),T=v.size,I=w.size;if(T===0||I===0)return 0;let N=0,[C,B]=T<I?[v,w]:[w,v];for(let F of C)B.has(F)&&N++;let L=2*N/(T+I),q=0,W=Math.min(T,I);return W>2&&(q=N/W,q>.6&&W/Math.max(T,I)<.6&&(q-=.25)),Math.max(y,L,q)}function Cl(e,t="",n=[]){let s=new Set,c=fb(t||""),l=v=>{let w=fb(kH0(v)),T=w.replace(N0.Season.PART_ANY,""),I=T.match(N0.Season.CN_STRUCTURE);if(I){let B={\u627F:"S2",\u8F6C:"S3",\u7ED3:"S4"};B[I[1]]&&s.add(B[I[1]])}if(v7r.forEach(B=>{let L=(B.useCleaned?T:w).match(B.regex);L&&s.add(B.prefix?`${B.prefix}${parseInt(L[1])}`:B.val)}),!PX.some(B=>{if(B.regex.test(T))return s.add(B.val),!0})){let B=T.match(N0.Season.SUFFIX_AMBIGUOUS);if(B){s.add("AMBIGUOUS");let L={II:"S2",III:"S3",IV:"S4"},q=B[1].toUpperCase();L[q]&&s.add(L[q])}}N0.Season.SUFFIX_SEQUEL.test(w)&&s.add("SEQUEL");let C={\u4E00:1,\u4E8C:2,\u4E09:3,\u56DB:4,\u4E94:5,final:99};for(let[B,L]of Object.entries(C))w.includes(`\u7B2C${B}\u5B63`)&&s.add(`S${L}`)};[e,...Array.isArray(n)?n:[]].filter(Boolean).forEach(l),c.includes("\u7EED\u7BC7")&&s.add("SEQUEL"),/(剧场版|movie|film|电影)/i.test(c)&&s.add("MOVIE"),/\b(ova|oad)\b/i.test(c)&&s.add("OVA"),/\b(sp|special)\b/i.test(c)&&s.add("SP");let d=Array.from(s),m=d.some(v=>v.startsWith("S")),g=d.some(v=>v.startsWith("P")),y=["MOVIE","OVA","SP","SEQUEL","AMBIGUOUS"].some(v=>s.has(v));return g&&!m&&s.add("S1"),!m&&!g&&!y&&s.add("S1"),s}function dc(e,t="",n=[]){let s=Cl(e,t,n),c=null;for(let l of s)if(l.startsWith("S")){let d=parseInt(l.substring(1));isNaN(d)||(c===null||d>c)&&(c=d)}return c}function h8(e,t){let n=(e+" "+(t||"")).toLowerCase(),s=n.includes("\u7535\u5F71"),c=n.includes("\u7535\u89C6\u5267");return s&&!c?"MOVIE":c&&!s?"TV":null}function hE(e,t,n){if(n&&N0.Category.ANIMEKO_SOURCE.test(n))return"ANIME";let s=(e+" "+(t||"")).toLowerCase();return N0.Category.ANIME_KW.test(s)?"ANIME":N0.Category.REAL_KW.test(s)?"REAL":"UNKNOWN"}function E7r(e,t,n=!0){if(!e||!t||zd(e)===zd(t))return!1;let s=w=>{if(!w)return"";let T=pi(w);return T=T.replace(N0.Clean.META_SUFFIX,"").replace(N0.Clean.YEAR_TAG,"").replace(N0.Clean.SOURCE_TAG,"").replace(N0.Clean.FROM_SUFFIX,"").replace(N0.Clean.WHITESPACE," "),T.trim().toLowerCase()},c=s(e),l=s(t);if(c===l)return!1;let d=w=>{let T=[":","\uFF1A"," code:"," code\uFF1A"," season"," part"];for(let N of T){let C=w.indexOf(N);if(C!==-1)return w.substring(C).trim()}let I=w.split(N0.Clean.WHITESPACE);return I.length>=2?I.slice(1).join(" "):null},m=d(c),g=d(l),[y,v]=c.length<l.length?[c,l]:[l,c];if(v.startsWith(y)){if(v.length===y.length)return!1;let w=v[y.length];if(N0.Clean.SUBTITLE_SEPARATOR.test(w)){let T=v.slice(y.length).replace(N0.Clean.SUBTITLE_SEPARATOR,"").trim();if(!n&&T.length>1||T.length>2)return!0}}return!!(m&&g&&S7r(m,g)<.2)}function vH0(e,t,n,s){if(!((n||"").includes("\u5267\u573A\u7248")||(s||"").includes("\u5267\u573A\u7248")))return!1;let l=g=>g?pi(g).replace(N0.Clean.YEAR_TAG,"").replace(N0.Clean.SOURCE_TAG,"").replace(N0.Clean.FROM_SUFFIX,"").trim():"",d=l(e),m=l(t);if(N0.Clean.SPACE_STRUCTURE.test(d)&&N0.Clean.SPACE_STRUCTURE.test(m)){let g=w=>{let T=w.split(N0.Clean.SPLIT_SPACES);return T.length>1?T.slice(1).join(" "):""},y=g(d),v=g(m);return!(N0.Season.PURE_PART.test(y)||N0.Season.PURE_PART.test(v))}return!1}function T7r(e,t){let n=e.match(N0.Clean.YEAR_DIGITS),s=t.match(N0.Clean.YEAR_DIGITS);if(!n||!s||n[1]!==s[1])return!1;let c=l=>l.replace(N0.Clean.YEAR_DIGITS,"").replace(N0.Clean.SOURCE_TAG,"").replace(N0.Clean.FROM_SUFFIX,"").replace(N0.Clean.PARENTHESES_CONTENT,"").replace(N0.Clean.NON_ALPHANUM_CN,"").trim().toLowerCase();return c(e)===c(t)}function I7r(e,t,n,s,c,l,d="",m=""){if(T7r(e,t))return!1;let g=hE(e,n,d),y=hE(t,s,m);if(g==="REAL"&&y==="ANIME"||g==="ANIME"&&y==="REAL")return!0;let v=(n||"").includes("3D"),w=(s||"").includes("3D"),T=(n||"").includes("2D"),I=(s||"").includes("2D"),N=!v&&!T,C=!w&&!I;if(!N&&C?/3[dD]/.test(t)?w=!0:/2[dD]/.test(t)&&(I=!0):!C&&N&&(/3[dD]/.test(e)?v=!0:/2[dD]/.test(e)&&(T=!0)),(v||T)&&(w||I)&&v!==w)return!0;let q=h8(e,n),W=h8(t,s);return!q||!W||q===W||vH0(e,t,n,s)?!1:c>0&&l>0?Math.abs(c-l)>5:!0}function R7r(e,t,n,s,c=[],l=[]){let d=Cl(e,n,c),m=Cl(t,s,l);if(d.size===0&&m.size===0)return!1;let g=T=>Array.from(T).some(I=>I.startsWith("S")&&parseInt(I.substring(1))>=2),y=T=>T.has("SEQUEL"),v=T=>T.has("AMBIGUOUS"),w=T=>T.has("S1");if(d.size>0&&m.size>0){if(v(d)&&w(m)||v(m)&&w(d))return!0;if(v(d)&&(g(m)||y(m))||v(m)&&(g(d)||y(d))||g(d)&&y(m)||g(m)&&y(d))return!1;for(let T of d)if(T.startsWith("S")){let I=m.has(T),N=Array.from(m).some(C=>C.startsWith("S"));if(!I&&N)return!0}return!1}return d.size!==m.size?!vH0(e,t,n,s):!1}function C7r(e,t,n,s,c=[],l=[]){let d=Cl(e,n,c),m=Cl(t,s,l),g=Array.from(d).filter(v=>v.startsWith("S")),y=Array.from(m).filter(v=>v.startsWith("S"));return g.length>0&&y.length>0?g.some(v=>y.includes(v)):!1}function N7r(e,t,n=!1){if(!e.year||!t.year)return .05;let s=e.year-t.year;if(s===0){if(e.month&&t.month){let l=Math.abs(e.month-t.month);return l>2?0:l===0?.2:.1}return .1}let c=Math.abs(s);return n&&c<=10?0:c>1?-1:0}function O7r(e,t,n,s,c,l=!1){if(/^(dandan|animeko)$/i.test(s)||/^(dandan|animeko)$/i.test(c))return!0;if(l){let g=Math.min(t,n);return g>0&&e/g>.5?!0:!(e<2)}let d=Math.max(t,n);if(d===0)return!1;let m=e/d;return!(d>5&&m<.18)}function OX(e){if(!e)return null;let t=e.toLowerCase();return t.includes("opening")?"opening":t.includes("ending")?"ending":t.includes("interview")?"interview":t.includes("bloopers")?"Bloopers":null}function Iu(e,t=""){let n=!1,s=t;if(e){let N=e.match(N0.Episode.DANDAN_TAG);N&&(s=N[1].toLowerCase())}if(/^(dandan|animeko)$/i.test(s)&&e){let N=e.replace(N0.Clean.SOURCE_TAG,"").replace(N0.Clean.FROM_SUFFIX,"").trim();(N0.Episode.SPECIAL_START.test(N)||N0.Episode.DANDAN_IGNORE.test(N))&&(n=!0)}let l=fb(e||""),d=N0.Episode.MOVIE_CHECK.test(l),m=N0.Episode.PV_CHECK.test(l),g=null,y=null,v=OX(e),w=m||n||!!v||N0.Episode.SPECIAL_CHECK.test(l),T=l.match(N0.Episode.SEASON_MATCH);T&&(y=parseInt(T[1]));let I=l.match(N0.Episode.NUM_STRATEGY_A);if(I)g=parseFloat(I[2]);else{let N=l.match(N0.Episode.NUM_STRATEGY_B);if(N)g=parseFloat(N[1]);else{let C=l.match(N0.Episode.NUM_STRATEGY_C);C&&(g=parseFloat(C[1]))}}return{isMovie:d,num:g,isSpecial:w,isPV:m,season:y,isStrictSpecial:n}}function LIe(e,t,n=""){if(!e)return[];let c=["animeko","bilibili","bilibili1","bahamut","dandan"].includes(n);if(!t||c)return e.map((m,g)=>({link:m,originalIndex:g}));let l=[],d=[];if(e.forEach((m,g)=>{let y=m.title||m.name||"";t.test(y)?d.push(y):l.push({link:m,originalIndex:g})}),d.length>0){let m=n?`[${n}] `:"";Wr("info",`[Merge-Check] ${m}\u547D\u4E2DEPISODE_TITLE_FILTER\u8FC7\u6EE4\uFF0C\u5DF2\u524D\u7F6E\u5254\u9664 ${d.length} \u96C6: ${d.join(", ")}`)}return l}var fH0=new Map;function DX(e,t,n){if(!e||e.length<2||!t)return"";let s=v=>{if(!v||!n)return v||"";try{let w=fH0.get(n);if(!w){let T=AH0(n);w=new RegExp(`(\\[|\u3010|\\s)?${T}(\\]|\u3011|\\s)?`,"gi"),fH0.set(n,w)}return v.replace(w,"").trim()}catch{return v}},c=s(t),l=c.match(N0.Clean.REDUNDANT_SEPARATOR);l&&(c=c.substring(0,l.index));let d=e.map(v=>{let w=v.link||v;return w?s(w.title||w.name||""):""});if(d.some(v=>!v))return"";let m=(v,w)=>{let T="";for(let I=0;I<v.length;I++)for(let N=I+1;N<=v.length;N++){let C=v.substring(I,N);w.includes(C)&&C.length>T.length&&(T=C)}return T},g=m(d[0],d[1]);if(g.length<2)return"";for(let v=2;v<d.length;v++)if(g=m(g,d[v]),g.length<2)return"";let y=m(g,c);if(!c.startsWith(y))return"";if(N0.Clean.REDUNDANT_UNSAFE_END.test(y)){let v=y.slice(0,-1).trim();return v.length>=2&&c.startsWith(v)?v:""}return y.length>=2&&(N0.Clean.REDUNDANT_VALID_CHARS.test(y)||y.length>3)?(Wr("info",`[Merge-Check] \u68C0\u6D4B\u5230\u96C6\u5185\u5197\u4F59\u6807\u9898\u5B57\u6BB5: "${y}" (\u5DF2\u5FFD\u7565\u6765\u6E90: ${n}, \u951A\u5B9A\u9A8C\u8BC1\u901A\u8FC7)`),y):""}function dH0(e,t){let n=new Set;if(!e)return n;let s=-1;for(let c=0;c<e.length;c++){let l=e[c].title||e[c].name||"",d=Iu(l,t);d.num!==null&&!d.isSpecial&&!d.isPV&&d.num%1===0&&(s=c)}return e.forEach((c,l)=>{let d=c.title||c.name||"",m=Iu(d,t);m.num!==null&&!m.isSpecial&&!m.isPV&&m.num%1!==0&&l<s&&n.add(m.num)}),n}function pH0(e,t,n,s){let c=[],l=[],d=0;e.forEach(m=>{let g=m.title||m.name||"",y=Iu(g,n);y.num!==null&&t.has(y.num)?(l.push(m),d++):c.push(m)}),d>0&&(e.length=0,e.push(...c,...l),Wr("info",`[Merge-Check] [${s}] \u81EA\u52A8\u6C89\u5E95: \u79FB\u52A8\u4E86 ${d} \u4E2A\u4E2D\u95F4\u63D2\u503C\u96C6\u6570 (${Array.from(t).join(",")}) \u5230\u672B\u5C3E`))}function mH0(e,t,n="Unspecified",s="Unspecified",c="",l="",d="",m=""){if(e.length===0||t.length===0)return 0;let g=DX(e,d,c),y=DX(t,m,l),v=(ne,re)=>ne?re&&ne.includes(re)?ne.replace(re,""):ne:"",w=(ne,re,ae,se)=>{let he=ne.link.title||"",be=v(he,se),ke=Iu(be,re),Se=Rl(be),Je=Se!=="Unspecified"?Se:ae,Ye=Je==="Unspecified"&&/^(dandan|animeko)$/i.test(re)?"JP":Je,Ue=mE(be),o0=Ye==="CN"?be.replace(N0.Similarity.CN_STRICT_CORE_REMOVE,""):null;return{info:ke,effLang:Ye,specialType:OX(be),cleanEpText:Ue,strictCnCore:o0}},T=e.map(ne=>w(ne,c,n,g)),I=t.map(ne=>w(ne,l,s,y)),N=null,C=null;T.forEach(({info:ne})=>{ne.num!==null&&!ne.isSpecial&&ne.num%1===0&&(N=N===null?ne.num:Math.min(N,ne.num))}),I.forEach(({info:ne})=>{ne.num!==null&&!ne.isSpecial&&ne.num%1===0&&(C=C===null?ne.num:Math.min(C,ne.num))});let B=N!==null&&C!==null?N-C:null,L=15,q=B!==null?-B:0,W=Math.max(Math.min(-L,q-L),-Math.max(e.length,t.length)),F=Math.min(Math.max(L,q+L),Math.max(e.length,t.length)),J=0,ee=-9999;for(let ne=W;ne<=F;ne++){let re=0,ae=0,se=0,he=new Map,be=!1,ke=null;for(let Se=0;Se<t.length;Se++){let Je=Se+ne;if(Je<0||Je>=e.length)continue;let Ye=T[Je],Ue=I[Se],o0=Ye.info,f0=Ue.info,O0=0;o0.isMovie!==f0.isMovie&&(O0+=Bx.EP_ALIGN.MOVIE_TYPE_MISMATCH),(o0.isStrictSpecial&&!f0.isSpecial||f0.isStrictSpecial&&!o0.isSpecial)&&(O0+=Bx.EP_ALIGN.SPECIAL_STRICT_MISMATCH);let tt=Ye.effLang==="Unspecified"?"JP":Ye.effLang,ct=Ue.effLang==="Unspecified"?"JP":Ue.effLang;tt===ct?O0+=Bx.EP_ALIGN.LANG_MATCH:O0+=Bx.EP_ALIGN.LANG_MISMATCH,o0.season!==null&&f0.season!==null&&o0.season!==f0.season&&(O0+=Bx.EP_ALIGN.SEASON_NUM_MISMATCH),(Ye.specialType||Ue.specialType)&&(Ye.specialType!==Ue.specialType?O0+=Bx.EP_ALIGN.SPECIAL_TYPE_MISMATCH:O0+=Bx.EP_ALIGN.SPECIAL_TYPE_MATCH),o0.isSpecial===f0.isSpecial&&(O0+=Bx.EP_ALIGN.IS_SPECIAL_MATCH),B!==null&&!o0.isSpecial&&!f0.isSpecial&&o0.num-f0.num===B&&(O0+=Bx.EP_ALIGN.SEASON_SHIFT_EXACT,be=!0);let h0=0;Ye.effLang==="CN"&&Ue.effLang==="CN"&&Ye.strictCnCore&&Ue.strictCnCore&&(Ye.strictCnCore.includes(Ue.strictCnCore)||Ue.strictCnCore.includes(Ye.strictCnCore))?h0=o0.num!==null&&f0.num!==null&&o0.num===f0.num?Bx.EP_ALIGN.CN_STRICT_MATCH:Bx.EP_ALIGN.CN_STRICT_MISMATCH:h0=lb(Ye.cleanEpText,Ue.cleanEpText),O0+=h0,ae+=h0,o0.num!==null&&f0.num!==null&&o0.num===f0.num&&(O0+=Bx.EP_ALIGN.NUMERIC_MATCH);let Lt=1;if(o0.num!==null&&!o0.isSpecial&&(ke!==null&&o0.num-ke>1?Lt=.1:ke=o0.num),O0*=Lt,h0*=Lt,ae+=h0,re+=O0,o0.num!==null&&f0.num!==null){let mt=(f0.num-o0.num).toFixed(4);he.set(mt,(he.get(mt)||0)+Lt)}se++}if(se>0){let Se=re/se,Je=0;for(let f0 of he.values())Je=Math.max(Je,f0);let Ye=Je/se,Ue=ae/se;Ye>.6&&(be||Ue>.33)&&(Se+=Bx.EP_ALIGN.PATTERN_CONSISTENCY_BONUS),Se+=Math.min(se*.15,1.5);let o0=he.get("0.0000")||0;o0>0&&(Se+=Bx.EP_ALIGN.ZERO_DIFF_BONUS_BASE,Se+=o0*Bx.EP_ALIGN.ZERO_DIFF_BONUS_PER_HIT),Se>ee&&(ee=Se,J=ne)}}return ee>.3?J:0}function D7r(e,t,n){let s=new Map,c=[];for(let m of e){if(n&&n.has(m.animeId))continue;let g=te.animes.find(T=>String(T.animeId)===String(m.animeId))||m;if(hE(g.animeTitle,g.typeDescription,g.source)==="REAL"){c.push(`   [\u5254\u9664] [${g.source}] ${g.animeTitle} (\u7C7B\u578B: \u771F\u4EBA\u5267/REAL)`);continue}if(h8(g.animeTitle,g.typeDescription)==="MOVIE"){c.push(`   [\u5254\u9664] [${g.source}] ${g.animeTitle} (\u7C7B\u578B: \u7535\u5F71/MOVIE)`);continue}let w=dc(g.animeTitle,g.typeDescription,g.aliases);if(w!==null&&g.links){let I=LIe(g.links,t,g.source).filter(N=>{let C=N.link.title||N.link.name||"",L=fb(C).replace(N0.Clean.SOURCE_TAG,"").replace(N0.Clean.FROM_SUFFIX,"").trim();return!(/^(dandan|animeko)$/i.test(g.source)&&(N0.Episode.SPECIAL_CHECK.test(L)||N0.Episode.DANDAN_IGNORE.test(L))||N0.Episode.MAP_EXCLUDE_KEYWORDS.test(L)||N0.Episode.MAP_EXCLUDE_KEYWORDS.test(C))}).length;if(I>0){s.has(w)||s.set(w,new Map);let N=s.get(w);N.has(I)||N.set(I,[]),N.get(I).push(g.source),c.push(`   [\u91C7\u7EB3] [${g.source}] S${w} = ${I}\u96C6 ("${g.animeTitle}")`)}else c.push(`   [\u5FFD\u7565] [${g.source}] S${w} (\u6709\u6548\u96C6\u6570\u4E3A 0)`)}}let l=new Map,d=[];for(let[m,g]of s.entries()){let y=0,v=0,w=[];for(let[I,N]of g.entries()){let C=N.length;C>v?(v=C,y=I,w=N):C===v&&I<y&&(y=I,w=N)}l.set(m,y);let T=Array.from(g.entries()).map(([I,N])=>`${I}\u96C6(x${N.length})[${N.join(",")}]`).join(", ");d.push(`S${m}=${y} (\u63A8\u65AD\u6765\u6E90: ${w.join(",")} | \u7EDF\u8BA1: ${T})`)}return(c.length>0||d.length>0)&&Wr("info",`[Merge-Check] [Map-Build] \u5B63\u5EA6\u5730\u56FE\u6784\u5EFA\u8BE6\u60C5:
