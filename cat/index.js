@@ -1063,7 +1063,7 @@ function createIPlayrSpider(rule, opts) {
     // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
     // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
     // 播放器只跟 127.0.0.1 打交道。
-    const PROXY_BUILD = "iplayr-proxy-v2";
+    const PROXY_BUILD = "iplayr-proxy-v2.1";
     let proxyBase = "http://127.0.0.1:9988";
     const diagLog = [];
     function diagPush(action, info) {
@@ -1175,8 +1175,22 @@ function createIPlayrSpider(rule, opts) {
         };
     }
 
+    // 列表响应短缓存：JSTV 常重复调 category/homeVod，90 秒内同 URL 不重复拉上游
+    const listCache = new Map();
     async function fetchList(url, fields) {
-        const { text, finalUrl } = await fetchText(url, reqHeaders());
+        const now = Date.now();
+        const hit = listCache.get(url);
+        if (hit && now - hit.ts < 90000) {
+            diagPush("list", { ms: 0, cached: true, u: url.slice(0, 80) });
+            return extractItems(hit.text, hit.finalUrl, fields);
+        }
+        const t0 = Date.now();
+        const { status, text, finalUrl } = await fetchText(url, reqHeaders());
+        diagPush("list", { ms: Date.now() - t0, status, cached: false, u: url.slice(0, 80) });
+        if (status === 200 && text) {
+            listCache.set(url, { text, finalUrl, ts: now });
+            if (listCache.size > 64) listCache.delete(listCache.keys().next().value);
+        }
         return extractItems(text, finalUrl, fields);
     }
 
