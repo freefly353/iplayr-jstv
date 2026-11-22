@@ -78,6 +78,16 @@ def main():
         rules.append((fn[:-5], rule))
     print(f"rules to pack: {len(rules)}")
 
+    # 启用清单（与原仓库 import.json 的 type=8 规则一致）；不在清单内的 enable:false
+    enabled = set()
+    enabled_path = os.path.join(BASE, "converter", "enabled.txt")
+    if os.path.exists(enabled_path):
+        for line in open(enabled_path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                enabled.add(line)
+    print(f"enabled sites: {len(enabled)}")
+
     # 组装蜘蛛区：解释器 + 规则常量 + 工厂
     parts = [interpreter_wrapped()]
     factories = []
@@ -91,7 +101,7 @@ def main():
             + "}\n"
         )
         factories.append(f"ip{i}(e)")
-        sites.append({"key": f"nodejs_{key}", "name": rule.get("title") or base, "enable": True})
+        sites.append({"key": f"nodejs_{key}", "name": rule.get("title") or base, "enable": (base in enabled) if enabled else True})
     spider_region = "\n".join(parts)
 
     ysp0_start = bundle.find("function ysp0(e){")
@@ -106,7 +116,7 @@ def main():
 
     # config：替换 sites.list
     sites_js = "list: [" + ", ".join(
-        "{key: %s, name: %s, enable: true}" % (json.dumps(s["key"]), json.dumps(s["name"], ensure_ascii=False))
+        "{key: %s, name: %s, enable: %s}" % (json.dumps(s["key"]), json.dumps(s["name"], ensure_ascii=False), "true" if s["enable"] else "false")
         for s in sites
     ) + "]"
     new_config, n = re.subn(r'list: \[\{key: "nodejs_ysp"[^\]]*\]', sites_js, config, count=1)

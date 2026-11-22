@@ -1,0 +1,15 @@
+# JSTV 启用清单：与原仓库 import.json 的 vods（type=8 的 iPlayr 规则）一致
+# 不在此清单的规则仍打包进 bundle，但 config 里 enable:false
+libvio2
+olevod
+pomo
+huangguo
+dbk
+4kav
+4kvm_movie
+aafun
+girigiri
+jddzx
+cz
+xigua
+ppnix
