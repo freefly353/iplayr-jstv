@@ -30,7 +30,7 @@ category(req){let b=(req&&req.body)||{};return core.category(b.id||b.tid||"0",b.
 detail(req){let b=(req&&req.body)||{};let id=Array.isArray(b.id)?b.id[0]:b.id;return core.detail(id);},
 search(req){let b=(req&&req.body)||{};return core.search(b.wd||b.key||"",false,b.page||b.pg||1);},
 play(req){let b=(req&&req.body)||{};let t=(req&&req.headers&&req.headers["x-forwarded-proto"])||"http",n=(req&&req.headers&&req.headers.host)||"127.0.0.1:9988";core.setProxyBase(t+"://"+n);return core.play(b.flag||b.playFrom||"",b.id||"");},
-proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}reply.send(body);});},
+proxy(req,reply){let params=Object.assign({},(req&&req.query)||{},(req&&req.params)||{});params.do=params.do||params["*"]||params.provider||"";return Promise.resolve(core.proxy(params)).then((result)=>{if(!Array.isArray(result)||result.length<3){reply.send(result);return;}let status=result[0],contentType=result[1],body=result[2],headers=result[3]||{};reply.code(status||200);if(contentType)reply.header("Content-Type",contentType);for(let k of Object.keys(headers)){if(k&&k.toLowerCase()!=="content-type")reply.header(k,headers[k]);}return body;});},
 destroy(){return core.destroy();}
 };
 return spider;

@@ -150,6 +150,32 @@ async function fetchBinary(url, headers, timeoutMs) {
     }
 }
 
+// 流式拉取：转成 Node Readable 交给 Fastify 边下边发（首字节更快）。
+// 转不了就退回整段缓冲，保证能播优先。
+async function fetchStream(url, headers, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 60000);
+    try {
+        const resp = await fetch(url, { headers: headers || {}, signal: ctrl.signal, redirect: "follow" });
+        let body = resp.body;
+        try {
+            const { Readable } = require("stream");
+            if (body && typeof Readable.fromWeb === "function") body = Readable.fromWeb(body);
+        } catch (_) {
+            body = Buffer.from(await resp.arrayBuffer());
+        }
+        return {
+            status: resp.status,
+            body,
+            contentType: resp.headers.get("content-type") || "application/octet-stream",
+            finalUrl: resp.url || url,
+        };
+    } catch (e) {
+        clearTimeout(timer);
+        throw e;
+    }
+}
+
 // ---------- JSONPath 子集 ----------
 // 支持 $、.key、[*]、[n]。返回匹配值数组。
 
@@ -851,9 +877,9 @@ function createIPlayrSpider(rule, opts) {
             }
             if (action === "seg") {
                 try {
-                    const resp = await fetchBinary(u, reqHeaders());
-                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && resp.body.length > 0, u: u.slice(0, 80) });
-                    if (resp.status !== 200 || !resp.body.length) {
+                    const resp = await fetchStream(u, reqHeaders());
+                    diagPush("seg", { status: resp.status, ok: resp.status === 200 && !!resp.body, u: u.slice(0, 80) });
+                    if (resp.status !== 200 || !resp.body) {
                         return [502, "text/plain", "upstream segment error", { "Content-Type": "text/plain" }];
                     }
                     return [200, resp.contentType, resp.body, { "Content-Type": resp.contentType }];
