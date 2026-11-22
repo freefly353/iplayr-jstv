@@ -1063,7 +1063,7 @@ function createIPlayrSpider(rule, opts) {
     // 播放器直连上游常被 UA 拦截（如 lumenbox 对 ffmpeg UA 返回 403），
     // 故 HLS 列表与分片全部经 spider 代理：spider 带浏览器 UA 拉上游，
     // 播放器只跟 127.0.0.1 打交道。
-    const PROXY_BUILD = "iplayr-proxy-v2.1";
+    const PROXY_BUILD = "iplayr-proxy-v2.2";
     let proxyBase = "http://127.0.0.1:9988";
     const diagLog = [];
     function diagPush(action, info) {
@@ -1175,12 +1175,12 @@ function createIPlayrSpider(rule, opts) {
         };
     }
 
-    // 列表响应短缓存：JSTV 常重复调 category/homeVod，90 秒内同 URL 不重复拉上游
+    // 列表响应短缓存：JSTV 常重复调 category/homeVod，5 分钟内同 URL 不重复拉上游
     const listCache = new Map();
     async function fetchList(url, fields) {
         const now = Date.now();
         const hit = listCache.get(url);
-        if (hit && now - hit.ts < 90000) {
+        if (hit && now - hit.ts < 300000) {
             diagPush("list", { ms: 0, cached: true, u: url.slice(0, 80) });
             return extractItems(hit.text, hit.finalUrl, fields);
         }
@@ -1218,7 +1218,17 @@ function createIPlayrSpider(rule, opts) {
             if (typeof url === "string" && url) proxyBase = url.replace(/\/+$/, "");
         },
 
-        init() {},
+        init() {
+            // 后台预热：先把第一个分类第一页拉进缓存，顺带建好到上游的连接，
+            // 用户点开列表时直接命中缓存，不用等跨境握手+拉取
+            try {
+                const c = (Array.isArray(R.category) ? R.category : [])[0];
+                if (c) {
+                    const url = fillTemplate(c.url0 || c.url1, { pg: 1 });
+                    fetchList(url, listFields("vod")).catch(() => {});
+                }
+            } catch (_) {}
+        },
 
         async home() {
             const cats = Array.isArray(R.category) ? R.category : [];
